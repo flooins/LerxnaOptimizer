@@ -288,7 +288,9 @@ function Get-RegValue {
     param([string]$Key, [string]$Name)
     try {
         $k = Get-Item -LiteralPath $Key -ErrorAction Stop
-        return $k.GetValue($Name, $null)
+        # The comma keeps byte arrays (binary values) in one piece; without it
+        # PowerShell would unroll them into a plain list of numbers
+        return , $k.GetValue($Name, $null)
     } catch { return $null }
 }
 
@@ -2194,8 +2196,12 @@ function Get-ProcessMap {
 
 function Get-ApprovedEnabled {
     param([string]$ApprovedKey, [string]$ValueName)
-    $v = Get-RegValue $ApprovedKey $ValueName
-    if ($v -is [byte[]] -and $v.Length -gt 0) { return (($v[0] -band 1) -eq 0) }
+    # Task Manager's format: first byte even = enabled, odd = disabled
+    $st = Get-RegState $ApprovedKey $ValueName
+    if ($st.Exists -and $st.Kind -eq 'Binary') {
+        $bytes = @($st.Value)
+        if ($bytes.Count -gt 0) { return (([int]$bytes[0] -band 1) -eq 0) }
+    }
     return $true
 }
 
