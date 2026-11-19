@@ -17,33 +17,88 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# Admin check (relaunches itself as Administrator if needed)
+# Compatibility checks + relaunch
+# This part only uses very basic PowerShell so it can show a clear
+# message on any Windows / PowerShell version instead of crashing.
 # ------------------------------------------------------------
+function Stop-WithMessage {
+    param([string]$Message)
+    Write-Host ""
+    Write-Host "  $Message" -ForegroundColor Red
+    Write-Host ""
+    try { Read-Host "  Press Enter to close" | Out-Null } catch {}
+    exit 1
+}
+
+if ($env:OS -ne 'Windows_NT') { Stop-WithMessage "Lerxna Optimizer only runs on Windows." }
+
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+    Stop-WithMessage ("This needs Windows PowerShell 5.1 (built into Windows 10 and 11). You have version {0}. On Windows 8.1, install 'Windows Management Framework 5.1' from Microsoft first." -f $PSVersionTable.PSVersion)
+}
+
+$OSBuild = 0
+try { $OSBuild = [int](Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).CurrentBuildNumber } catch {}
+if (-not $OSBuild) { $OSBuild = [Environment]::OSVersion.Version.Build }
+if ($OSBuild -lt 9600) {
+    Stop-WithMessage "Windows 7 and 8 are not supported (they're missing tools this optimizer needs). Windows 8.1, 10 and 11 are supported."
+}
+
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Stop-WithMessage "PowerShell is locked down on this PC (Constrained Language Mode - usually set by a school or work IT department). Lerxna Optimizer can't run here."
+}
+
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $IsAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $IsCore    = $PSVersionTable.PSEdition -eq 'Core'
+# 32-bit PowerShell on 64-bit Windows writes registry settings to the wrong place
+$Is32On64  = [Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess
 
-if (-not $IsAdmin -or $IsCore) {
-    # Relaunch in Windows PowerShell 5.1 as Administrator (the Appx and
-    # restore point commands work best there).
-    if ($PSCommandPath) {
+if (-not $IsAdmin -or $IsCore -or $Is32On64) {
+    # Relaunch in 64-bit Windows PowerShell 5.1, as Administrator
+    $psExe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($Is32On64) { $psExe = Join-Path $env:windir 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' }
+    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+
+    $scriptPath = $PSCommandPath
+    if ($scriptPath) {
+        # The Administrator window can't see mapped network drives, so copy the script locally first
+        $onNetwork = $scriptPath.StartsWith('\\')
+        if (-not $onNetwork) {
+            try { $onNetwork = ([System.IO.DriveInfo]::new($scriptPath.Substring(0, 1))).DriveType -eq 'Network' } catch {}
+        }
+        if ($onNetwork) {
+            try {
+                $localCopy = Join-Path $env:TEMP 'LerxnaOptimizer.ps1'
+                Copy-Item -LiteralPath $scriptPath -Destination $localCopy -Force -ErrorAction Stop
+                $scriptPath = $localCopy
+            } catch {}
+        }
+
+        $launchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptPath`"")
         try {
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ErrorAction Stop `
-                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+            if ($IsAdmin) { Start-Process -FilePath $psExe -ArgumentList $launchArgs -ErrorAction Stop }
+            else          { Start-Process -FilePath $psExe -ArgumentList $launchArgs -Verb RunAs -ErrorAction Stop }
         } catch {
-            Write-Host "ERROR: Please run this script as Administrator!" -ForegroundColor Red
-            Read-Host "Press Enter to exit" | Out-Null
+            Stop-WithMessage "Lerxna Optimizer needs Administrator rights. Right-click it and choose 'Run as administrator' (or click Yes on the prompt)."
         }
         exit
     }
-    if (-not $IsAdmin) {
-        Write-Host "ERROR: Please run this script as Administrator!" -ForegroundColor Red
-        exit
-    }
+
+    # Pasted into a console instead of run from a file
+    if (-not $IsAdmin) { Stop-WithMessage "Please open PowerShell as Administrator and run Lerxna Optimizer again." }
+    Write-Host "  Note: for best results run this in 64-bit Windows PowerShell 5.1." -ForegroundColor Yellow
 }
 
 $ProgressPreference = 'SilentlyContinue'
 try { $Host.UI.RawUI.WindowTitle = 'Lerxna Optimizer v2.0' } catch {}
+# Make the window wide enough for the tables (silently ignored where not possible, e.g. Windows Terminal)
+try {
+    $raw = $Host.UI.RawUI
+    if ($raw.WindowSize.Width -lt 120 -and $raw.MaxPhysicalWindowSize.Width -ge 120) {
+        if ($raw.BufferSize.Width -lt 120) { $raw.BufferSize = New-Object System.Management.Automation.Host.Size 120, ([Math]::Max($raw.BufferSize.Height, 3000)) }
+        $raw.WindowSize = New-Object System.Management.Automation.Host.Size 120, $raw.WindowSize.Height
+    }
+} catch {}
 
 # ------------------------------------------------------------
 # Globals
@@ -216,7 +271,9 @@ function Set-ServiceStartup {
 
 function Disable-TaskSafe {
     param([string]$TaskPath, [string]$TaskName)
-    $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $Script:Has.Tasks) { return }
+    $t = $null
+    try { $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop } catch {}
     if ($t -and $t.State -ne 'Disabled') {
         try {
             $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null
@@ -331,6 +388,49 @@ function Clear-Folder {
     }
 }
 
+# ------------------------------------------------------------
+# Compatibility helpers
+# ------------------------------------------------------------
+# Which optional Windows tools exist on this PC (some are missing on
+# Windows 8.1, Server, LTSC and stripped-down Windows builds)
+$Script:Has = @{
+    Tasks       = [bool](Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)
+    Appx        = [bool](Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)
+    Provisioned = [bool](Get-Command Get-AppxProvisionedPackage -ErrorAction SilentlyContinue)
+    Storage     = [bool](Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue)
+    RecycleBin  = [bool](Get-Command Clear-RecycleBin -ErrorAction SilentlyContinue)
+}
+
+# WMI query that never crashes: tries CIM, then old-style WMI, else returns nothing
+function Get-CimSafe {
+    param([string]$Class, [string]$Filter = '')
+    try {
+        if ($Filter) { return Get-CimInstance -ClassName $Class -Filter $Filter -ErrorAction Stop }
+        return Get-CimInstance -ClassName $Class -ErrorAction Stop
+    } catch {
+        try {
+            if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+                if ($Filter) { return Get-WmiObject -Class $Class -Filter $Filter -ErrorAction Stop }
+                return Get-WmiObject -Class $Class -ErrorAction Stop
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Get-InstalledAppx {
+    if (-not $Script:Has.Appx) { return @() }
+    $list = @()
+    try { $list = @(Get-AppxPackage -AllUsers -ErrorAction Stop) } catch {}
+    if ($list.Count -eq 0) { try { $list = @(Get-AppxPackage -ErrorAction Stop) } catch {} }
+    return $list
+}
+
+function Get-AllTasks {
+    if (-not $Script:Has.Tasks) { return @() }
+    try { return @(Get-ScheduledTask -ErrorAction Stop) } catch { return @() }
+}
+
 # ============================================================
 # PC SCAN
 # ============================================================
@@ -338,41 +438,76 @@ function Get-SystemProfile {
     Write-Host "  Scanning your PC, this takes a few seconds..." -ForegroundColor Gray
     $s = @{}
 
-    $os = Get-CimInstance Win32_OperatingSystem
-    $s.OSName    = $os.Caption
-    $s.Build     = [int]$os.BuildNumber
-    $s.IsWin11   = $s.Build -ge 22000
-    $s.RamGB     = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-    $s.FreeRamGB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-    $up = (Get-Date) - $os.LastBootUpTime
-    $s.UptimeDays  = [int]$up.TotalDays
-    $s.UptimeText  = "{0} day(s), {1} hour(s)" -f [int][math]::Floor($up.TotalDays), $up.Hours
+    $cv = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $os = Get-CimSafe 'Win32_OperatingSystem' | Select-Object -First 1
 
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $chassis = @((Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue).ChassisTypes)
-    $portable = [bool]($chassis | Where-Object { $_ -in 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32 })
-    $s.IsLaptop = $portable -or ($cs.PCSystemType -eq 2)
+    # Windows name/build (registry fallback if WMI is broken)
+    $s.Build = 0
+    if ($os -and $os.BuildNumber) { $s.Build = [int]$os.BuildNumber }
+    if (-not $s.Build) { $s.Build = [int](Get-RegValue $cv 'CurrentBuildNumber') }
+    if (-not $s.Build) { $s.Build = [Environment]::OSVersion.Version.Build }
+    $s.IsWin11 = $s.Build -ge 22000
+    $s.OSName = if ($os -and $os.Caption) { ([string]$os.Caption).Trim() } else { [string](Get-RegValue $cv 'ProductName') }
+    if ($s.IsWin11) { $s.OSName = $s.OSName -replace 'Windows 10', 'Windows 11' }   # registry still says "10" on Win11
+    if (-not $s.OSName) { $s.OSName = 'Windows' }
+    $s.Edition   = [string](Get-RegValue $cv 'EditionID')
+    $s.IsHome    = $s.Edition -match '^Core'          # Home editions are "Core..."
+    $s.IsServer  = ($s.OSName -match 'Server') -or ($os -and $os.ProductType -gt 1)
+    $s.Arch      = $env:PROCESSOR_ARCHITECTURE
+    if ($env:PROCESSOR_ARCHITEW6432) { $s.Arch = $env:PROCESSOR_ARCHITEW6432 }
 
-    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-    $s.CPU = if ($cpu) { ([string]$cpu.Name).Trim() } else { 'Unknown' }
-    $s.GPUs = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Where-Object { $_ })
+    # RAM
+    $s.RamGB = 0; $s.FreeRamGB = 0
+    if ($os -and $os.TotalVisibleMemorySize) {
+        $s.RamGB     = [math]::Round([double]$os.TotalVisibleMemorySize / 1MB, 1)
+        $s.FreeRamGB = [math]::Round([double]$os.FreePhysicalMemory / 1MB, 1)
+    }
+
+    # Uptime (CIM gives a date, old WMI gives a string)
+    $s.UptimeDays = 0; $s.UptimeText = 'Unknown'
+    try {
+        $boot = $os.LastBootUpTime
+        if ($boot -is [string]) { $boot = [Management.ManagementDateTimeConverter]::ToDateTime($boot) }
+        if ($boot -is [datetime]) {
+            $up = (Get-Date) - $boot
+            $s.UptimeDays = [int][math]::Floor($up.TotalDays)
+            $s.UptimeText = "{0} day(s), {1} hour(s)" -f $s.UptimeDays, $up.Hours
+        }
+    } catch {}
+
+    # Laptop or desktop
+    $cs = Get-CimSafe 'Win32_ComputerSystem' | Select-Object -First 1
+    $chassis = @(Get-CimSafe 'Win32_SystemEnclosure' | ForEach-Object { $_.ChassisTypes })
+    $portable = [bool]($chassis | Where-Object { @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32) -contains $_ })
+    $hasBattery = [bool](Get-CimSafe 'Win32_Battery')
+    $s.IsLaptop = $portable -or ($cs -and $cs.PCSystemType -eq 2) -or ($hasBattery -and -not $chassis.Count)
+
+    # Who is signed in vs. who is running this (matters for per-user settings)
+    $s.RunningAs   = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $s.ConsoleUser = if ($cs -and $cs.UserName) { [string]$cs.UserName } else { '' }
+
+    $cpu = Get-CimSafe 'Win32_Processor' | Select-Object -First 1
+    $s.CPU = if ($cpu -and $cpu.Name) { ([string]$cpu.Name).Trim() } else { [string](Get-RegValue 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' 'ProcessorNameString') }
+    if (-not $s.CPU) { $s.CPU = 'Unknown' }
+    $s.GPUs = @(Get-CimSafe 'Win32_VideoController' | ForEach-Object { $_.Name } | Where-Object { $_ })
     $s.HasNvidia    = [bool]($s.GPUs -match 'NVIDIA')
     $s.HasAMDGpu    = [bool]($s.GPUs -match 'AMD|Radeon')
     $s.HasDedicated = [bool]($s.GPUs -match 'NVIDIA|Radeon RX|Radeon Pro|Arc')
 
     # System drive
     $s.DiskType = 'Unknown'
-    try {
+    if ($Script:Has.Storage) { try {
         $part = Get-Partition -DriveLetter $env:SystemDrive.Substring(0, 1) -ErrorAction Stop
         $pd = Get-PhysicalDisk -ErrorAction Stop | Where-Object { [string]$_.DeviceId -eq [string]$part.DiskNumber } | Select-Object -First 1
         if ($pd) {
             $s.DiskType = [string]$pd.MediaType
             if ([string]$pd.BusType -eq 'NVMe') { $s.DiskType = 'NVMe SSD' }
         }
-    } catch {}
+    } catch {} }
     $s.IsSSD = $s.DiskType -match 'SSD|NVMe'
     $s.IsHDD = $s.DiskType -eq 'HDD'
-    $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue
+    $ld = Get-CimSafe 'Win32_LogicalDisk' "DeviceID='$($env:SystemDrive)'" | Select-Object -First 1
+    if (-not $ld) { try { $ld = [System.IO.DriveInfo]::new($env:SystemDrive) | Select-Object @{ n = 'Size'; e = { $_.TotalSize } }, @{ n = 'FreeSpace'; e = { $_.AvailableFreeSpace } } } catch {} }
     if ($ld -and $ld.Size) {
         $s.DiskFreeGB = [math]::Round($ld.FreeSpace / 1GB, 1)
         $s.DiskSizeGB = [math]::Round($ld.Size / 1GB, 0)
@@ -402,8 +537,7 @@ function Get-SystemProfile {
     $s.HasEdge = (Test-Path "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe") -or
                  (Test-Path "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe")
 
-    $s.Appx = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
-    if ($s.Appx.Count -eq 0) { $s.Appx = @(Get-AppxPackage -ErrorAction SilentlyContinue) }
+    $s.Appx = @(Get-InstalledAppx)
     $s.HasXbox = [bool]($s.Appx | Where-Object { $_.Name -like 'Microsoft.Xbox*' -or $_.Name -eq 'Microsoft.GamingApp' })
 
     return $s
@@ -439,7 +573,7 @@ function Show-SystemReport {
     Section "Your PC"
     $gpuText = if ($s.GPUs.Count) { $s.GPUs -join ' + ' } else { 'Unknown' }
     $kind    = if ($s.IsLaptop) { 'Laptop' } else { 'Desktop' }
-    Write-Host ("   Windows  : {0} (build {1})" -f $s.OSName, $s.Build)
+    Write-Host ("   Windows  : {0} (build {1}, {2})" -f $s.OSName, $s.Build, $s.Arch)
     Write-Host ("   Type     : {0}" -f $kind)
     Write-Host ("   CPU      : {0}" -f $s.CPU)
     Write-Host ("   GPU      : {0}" -f $gpuText)
@@ -464,6 +598,12 @@ function Show-SystemReport {
     if ($safe.Count -ge 3)              { $tips += "$($safe.Count) startup items are safe to turn off - try the Startup scanner (option 3)." }
     if ($s.IsLaptop)                    { $tips += "Laptop detected - tweaks that drain battery won't be marked as recommended." }
     if ($s.GameLaunchers.Count)         { $tips += "Games detected - don't miss the Gaming tweaks." }
+    if ($s.IsHome)                      { $tips += "Windows Home edition: a few privacy settings are 'policies' that Home only partly follows. They're still safe to apply." }
+    if ($s.IsServer)                    { $tips += "Windows Server detected - only apply tweaks you understand; some (Xbox, Store apps) don't exist here." }
+    if (-not $Script:Has.Appx)          { $tips += "This Windows has no Store app support, so app removal is hidden." }
+    if ($s.ConsoleUser -and $s.RunningAs -and ($s.ConsoleUser -ne $s.RunningAs)) {
+        $tips += "You're signed in as $($s.ConsoleUser) but running this as $($s.RunningAs). Per-user settings (dark mode, taskbar, your startup apps) will apply to $($s.RunningAs)."
+    }
     if ($tips.Count) {
         Write-Host ""
         Write-Host "   Tips for your PC:" -ForegroundColor Cyan
@@ -611,7 +751,7 @@ function Get-BloatServiceTargets {
             $targets.Add(@{ Kind = 'Service'; Name = $svc.N; Label = $svc.L; StartType = $svc.T })
         }
     }
-    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' })
+    $tasks = @(Get-AllTasks | Where-Object { $_.State -ne 'Disabled' })
     $patterns = @(
         @{ P = '*Xbox*';                           L = 'Xbox background tasks' }
         @{ P = 'XblGameSaveTask';                  L = 'Xbox game save sync task' }
@@ -640,7 +780,10 @@ function Remove-AppxSafe {
             catch { Write-Log "APPX FAILED $($p.Name): $($_.Exception.Message)" }
         }
     }
-    if ($null -eq $Script:Provisioned) { $Script:Provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue) }
+    if ($null -eq $Script:Provisioned) {
+        $Script:Provisioned = @()
+        if ($Script:Has.Provisioned) { try { $Script:Provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) } catch {} }
+    }
     foreach ($pp in @($Script:Provisioned | Where-Object { $_.DisplayName -like $Pattern })) {
         try { Remove-AppxProvisionedPackage -Online -PackageName $pp.PackageName -ErrorAction Stop | Out-Null } catch {}
     }
@@ -689,7 +832,7 @@ function Invoke-AppRemoval {
         Write-Host "     Removing $($a.Name)..." -ForegroundColor DarkGray
         Remove-AppxSafe $a.Id
     }
-    $Script:Sys.Appx = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    $Script:Sys.Appx = @(Get-InstalledAppx)
     Info "Removed $($toRemove.Count) app(s). You can reinstall any of them from the Microsoft Store."
 }
 
@@ -1028,7 +1171,7 @@ function Initialize-Tweaks {
            Action = { Set-Reg "$($Script:AdvKey)\TaskbarDeveloperSettings" 'TaskbarEndTask' 1 } }
 
         # ---------------- APPS ----------------
-        @{ Cat = 'Apps & Bloatware'; Title = 'Remove built-in bloat apps'; Interactive = $true
+        @{ Cat = 'Apps & Bloatware'; Title = 'Remove built-in bloat apps'; Interactive = $true; Show = $Script:Has.Appx
            Q = 'Remove built-in bloat apps? (shows you only the ones installed on this PC)'
            Action = { Invoke-AppRemoval -List $Script:BloatApps -Title 'built-in' } }
 
@@ -1064,8 +1207,9 @@ function Initialize-Tweaks {
                Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1
                Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSync' 1
                Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OneDrive' -ErrorAction SilentlyContinue
-               Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'OneDrive*' } |
-                   Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+               foreach ($odt in @(Get-AllTasks | Where-Object { $_.TaskName -like 'OneDrive*' })) {
+                   Disable-TaskSafe $odt.TaskPath $odt.TaskName
+               }
            } }
 
         # ---------------- WINDOWS UPDATE ----------------
@@ -1356,6 +1500,7 @@ function Get-StartupItems {
     $items = New-Object System.Collections.Generic.List[object]
 
     # 1) Registry "Run" keys
+    try {
     $runSources = @(
         @{ Key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';             Approved = "$($Script:ApprovedHKCU)\Run";   Scope = 'This user' }
         @{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Approved = "$($Script:ApprovedHKLM)\Run";   Scope = 'All users' }
@@ -1373,7 +1518,10 @@ function Get-StartupItems {
         }
     }
 
+    } catch { Write-Log "SCAN FAILED (Run keys): $($_.Exception.Message)" }
+
     # 2) Startup folders
+    try {
     $folders = @(
         @{ Path = [Environment]::GetFolderPath('Startup');       Approved = "$($Script:ApprovedHKCU)\StartupFolder"; Scope = 'This user' }
         @{ Path = [Environment]::GetFolderPath('CommonStartup'); Approved = "$($Script:ApprovedHKLM)\StartupFolder"; Scope = 'All users' }
@@ -1397,7 +1545,10 @@ function Get-StartupItems {
         }
     }
 
+    } catch { Write-Log "SCAN FAILED (Startup folders): $($_.Exception.Message)" }
+
     # 3) Microsoft Store app startup tasks
+    try {
     $appRoot = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData'
     if (Test-Path -LiteralPath $appRoot) {
         $appxByFamily = @{}
@@ -1409,7 +1560,7 @@ function Get-StartupItems {
                 $state = $taskKey.GetValue('State', $null)
                 if ($null -eq $state) { continue }
                 $state = [int]$state
-                if ($state -notin 1, 2) { continue }    # 1 = turned off by user, 2 = on
+                if (@(1, 2) -notcontains $state) { continue }    # 1 = turned off by user, 2 = on
                 $family = $pkgKey.PSChildName
                 $friendly = (($family -split '_')[0] -split '\.')[-1]
                 $pkg = $appxByFamily[$family]
@@ -1429,8 +1580,11 @@ function Get-StartupItems {
         }
     }
 
+    } catch { Write-Log "SCAN FAILED (Store apps): $($_.Exception.Message)" }
+
     # 4) Third-party scheduled tasks that run at logon/boot, or are updaters
-    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+    try {
+    foreach ($t in @(Get-AllTasks)) {
         if ($t.TaskPath -like '\Microsoft\*') { continue }
         $trig = @($t.Triggers | Where-Object { $_ } | ForEach-Object { $_.CimClass.CimClassName })
         $atLogon = [bool]($trig -match 'Logon|Boot')
@@ -1444,8 +1598,11 @@ function Get-StartupItems {
             -Extra @{ TaskPath = $t.TaskPath; TaskName = $t.TaskName; Location = "$($t.TaskPath)$($t.TaskName)"; Scope = $scope }))
     }
 
+    } catch { Write-Log "SCAN FAILED (Scheduled tasks): $($_.Exception.Message)" }
+
     # 5) Third-party services that start automatically
-    foreach ($svc in @(Get-CimInstance -ClassName Win32_Service -Filter "StartMode='Auto'" -ErrorAction SilentlyContinue)) {
+    try {
+    foreach ($svc in @(Get-CimSafe 'Win32_Service' "StartMode='Auto'")) {
         $exe = Get-ExeFromCommand $svc.PathName
         if (-not $exe -or $exe -like "$env:windir\*" -or $exe -like '*\Windows Defender*') { continue }
         $info = Get-FileInfo $exe
@@ -1454,6 +1611,7 @@ function Get-StartupItems {
         $items.Add((New-StartupItem -Type 'Service' -Name $svc.DisplayName -Command $svc.PathName -Exe $exe -Enabled $true -ProcMap $procMap `
             -Extra @{ ServiceName = $svc.Name; PrevStart = $prev; Location = $svc.Name; Scope = 'Windows service (will be set to Manual)' }))
     }
+    } catch { Write-Log "SCAN FAILED (Services): $($_.Exception.Message)" }
 
     return $items
 }
@@ -1547,10 +1705,28 @@ function Stop-ItemProcesses {
 }
 
 # ---------------- display ----------------
+function Get-ConsoleWidth {
+    try { $w = $Host.UI.RawUI.WindowSize.Width; if ($w -gt 20) { return $w } } catch {}
+    return 120
+}
+
 function Show-StartupList {
     param($Items)
+    # Fit the table to the window: drop columns on narrow windows
+    $w = Get-ConsoleWidth
+    $showType = $w -ge 85
+    $showPub  = $w -ge 110
+    $fixed = 2 + 3 + 2 + 9 + 17
+    if ($showType) { $fixed += 11 }
+    if ($showPub)  { $fixed += 20 }
+    $nameW = [Math]::Max(14, [Math]::Min(32, $w - $fixed - 2))
+    $pubW  = [Math]::Max(10, $w - $fixed - $nameW - 2 + 20)
+
     Write-Host ""
-    Write-Host ("  {0,3}  {1,-8} {2,-16} {3,-32} {4,-10} {5}" -f '#', 'NOW', 'ADVICE', 'NAME', 'TYPE', 'PUBLISHER') -ForegroundColor DarkGray
+    $header = ("  {0,3}  {1,-8} {2,-16} " -f '#', 'NOW', 'ADVICE') + ("{0,-$nameW} " -f 'NAME')
+    if ($showType) { $header += "{0,-10} " -f 'TYPE' }
+    if ($showPub)  { $header += 'PUBLISHER' }
+    Write-Host $header -ForegroundColor DarkGray
     $i = 0
     foreach ($it in $Items) {
         $i++
@@ -1558,8 +1734,14 @@ function Show-StartupList {
         Write-Host ("  {0,3}  " -f $i) -NoNewline
         Write-Host ("{0,-8} " -f $now) -ForegroundColor Cyan -NoNewline
         Write-Host ("{0,-16} " -f (Get-RecLabel $it.Rec)) -ForegroundColor (Get-RecColor $it.Rec) -NoNewline
-        Write-Host ("{0,-32} {1,-10} " -f (Get-Short $it.Name 32), $it.TypeLabel) -NoNewline
-        Write-Host (Get-Short $it.Publisher 26) -ForegroundColor DarkGray
+        $line = "{0,-$nameW} " -f (Get-Short $it.Name $nameW)
+        if ($showType) { $line += "{0,-10} " -f $it.TypeLabel }
+        if ($showPub) {
+            Write-Host $line -NoNewline
+            Write-Host (Get-Short $it.Publisher $pubW) -ForegroundColor DarkGray
+        } else {
+            Write-Host $line
+        }
     }
     Write-Host ""
     Write-Host "  NOW = RAM it's using right now if it's running." -ForegroundColor DarkGray
@@ -1628,9 +1810,11 @@ function Invoke-StartupOneByOne {
 function Show-HeavyApps {
     Section "What's using your RAM right now"
     $s = $Script:Sys
-    $os = Get-CimInstance Win32_OperatingSystem
-    $usedGB = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
-    Write-Host "   RAM in use: $usedGB GB of $($s.RamGB) GB" -ForegroundColor White
+    $os = Get-CimSafe 'Win32_OperatingSystem' | Select-Object -First 1
+    if ($os -and $os.TotalVisibleMemorySize) {
+        $usedGB = [math]::Round(([double]$os.TotalVisibleMemorySize - [double]$os.FreePhysicalMemory) / 1MB, 1)
+        Write-Host "   RAM in use: $usedGB GB of $($s.RamGB) GB" -ForegroundColor White
+    }
 
     $groups = @(Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $Script:ProtectedProcs -notcontains $_.ProcessName -and $_.Id -ne $PID } |
@@ -1648,18 +1832,23 @@ function Show-HeavyApps {
 
     if ($groups.Count -eq 0) { Info "Nothing heavy running besides Windows itself."; return }
     Write-Host ""
-    Write-Host ("  {0,3}  {1,-8} {2,-12} {3,-30} {4}" -f '#', 'RAM', 'KIND', 'APP', 'PUBLISHER') -ForegroundColor DarkGray
+    $showPub = (Get-ConsoleWidth) -ge 100
+    Write-Host ("  {0,3}  {1,-8} {2,-12} {3,-30} {4}" -f '#', 'RAM', 'KIND', 'APP', $(if ($showPub) { 'PUBLISHER' } else { '' })) -ForegroundColor DarkGray
     $i = 0
     foreach ($g in $groups) {
         $i++
         $kind = if ($g.HasWindow) { 'open window' } else { 'background' }
-        $pub = (Get-FileInfo $g.Path).Company
+        $pub = if ($showPub) { (Get-FileInfo $g.Path).Company } else { '' }
         $name = if ($g.Count -gt 1) { "$($g.Name) (x$($g.Count))" } else { $g.Name }
         Write-Host ("  {0,3}  " -f $i) -NoNewline
         Write-Host ("{0,-8} " -f ("{0}MB" -f $g.MemMB)) -ForegroundColor Cyan -NoNewline
         Write-Host ("{0,-12} " -f $kind) -ForegroundColor $(if ($g.HasWindow) { 'Gray' } else { 'Yellow' }) -NoNewline
-        Write-Host ("{0,-30} " -f (Get-Short $name 30)) -NoNewline
-        Write-Host (Get-Short $pub 28) -ForegroundColor DarkGray
+        if ($showPub) {
+            Write-Host ("{0,-30} " -f (Get-Short $name 30)) -NoNewline
+            Write-Host (Get-Short $pub 28) -ForegroundColor DarkGray
+        } else {
+            Write-Host (Get-Short $name 30)
+        }
     }
     Write-Host ""
     $txt = Read-Host "  Type numbers to close now (e.g. 1,3), or just press Enter to skip"
@@ -1768,7 +1957,8 @@ function Invoke-Cleanup {
         foreach ($item in $bin.Items()) { $binSize += [double]$item.Size }
     } catch {}
     if ($binSize -ge 1MB -and (Ask "Empty the Recycle Bin? ($(Format-Size $binSize))")) {
-        Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+        if ($Script:Has.RecycleBin) { Clear-RecycleBin -Force -ErrorAction SilentlyContinue }
+        else { foreach ($item in @($bin.Items())) { try { Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction SilentlyContinue } catch {} } }
         $freed += $binSize
         Done "Recycle Bin emptied."
     }
@@ -1906,17 +2096,35 @@ function Complete-Run {
 # ============================================================
 # MAIN
 # ============================================================
+# Runs a section; if anything unexpected goes wrong it shows the error
+# and goes back to the menu instead of closing the window.
+function Invoke-Safely {
+    param([scriptblock]$Block, [string]$Name)
+    try { & $Block }
+    catch {
+        Write-Host ""
+        Warn "$Name ran into a problem: $($_.Exception.Message)"
+        Info "Nothing else was changed. Details are in the log: $Script:LogFile"
+        Write-Log ("ERROR in {0}: {1} (line {2})" -f $Name, $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber)
+    }
+}
+
 Show-Banner
 Write-Log "Lerxna Optimizer v$($Script:Version) started"
-$Script:Sys = Get-SystemProfile
-Write-Host "  Scanning startup apps..." -ForegroundColor Gray
-$Script:LastScan = @(Get-StartupItems)
-Show-SystemReport
+Invoke-Safely -Name 'PC scan' -Block {
+    $Script:Sys = Get-SystemProfile
+    Write-Host "  Scanning startup apps..." -ForegroundColor Gray
+    $Script:LastScan = @(Get-StartupItems)
+    Show-SystemReport
+}
+if (-not $Script:Sys) {
+    Stop-WithMessage "Couldn't read basic information about this PC (Windows Management Instrumentation may be broken). Try restarting, then run Lerxna Optimizer again."
+}
 
 Write-Host ""
 Pink "  You'll be asked before every change. Press Y to apply, N to skip."
 if (Ask "Create a System Restore point before making changes?" 'REC' 'Lets you roll back everything if you don''t like a change.') {
-    New-RestorePoint
+    Invoke-Safely -Name 'Restore point' -Block { New-RestorePoint }
 }
 
 $running = $true
@@ -1934,29 +2142,35 @@ while ($running) {
 
     switch ($choice) {
         '1' {
-            Invoke-TweakWizard
-            Invoke-StartupScanner
-            Invoke-Cleanup
-            Complete-Run
+            Invoke-Safely -Name 'System tweaks'   -Block { Invoke-TweakWizard }
+            Invoke-Safely -Name 'Startup scanner' -Block { Invoke-StartupScanner }
+            Invoke-Safely -Name 'Junk cleanup'    -Block { Invoke-Cleanup }
+            Invoke-Safely -Name 'Summary'         -Block { Complete-Run }
         }
-        '2' { Invoke-TweakWizard }
-        '3' { Invoke-StartupScanner }
-        '4' { Invoke-Cleanup }
-        '5' { Invoke-UndoMenu }
-        '6' { New-RestorePoint }
+        '2' { Invoke-Safely -Name 'System tweaks'   -Block { Invoke-TweakWizard } }
+        '3' { Invoke-Safely -Name 'Startup scanner' -Block { Invoke-StartupScanner } }
+        '4' { Invoke-Safely -Name 'Junk cleanup'    -Block { Invoke-Cleanup } }
+        '5' { Invoke-Safely -Name 'Undo menu'       -Block { Invoke-UndoMenu } }
+        '6' { Invoke-Safely -Name 'Restore point'   -Block { New-RestorePoint } }
         '7' {
-            $Script:Sys = Get-SystemProfile
-            $Script:LastScan = @(Get-StartupItems)
-            Show-SystemReport
+            Invoke-Safely -Name 'PC scan' -Block {
+                $Script:Sys = Get-SystemProfile
+                $Script:LastScan = @(Get-StartupItems)
+                Show-SystemReport
+            }
         }
         '0' { $running = $false }
     }
 }
 
-if (($Script:Applied.Count + $Script:StartupChanges) -ne $Script:SummaryShownAt) { Complete-Run }
+if (($Script:Applied.Count + $Script:StartupChanges) -ne $Script:SummaryShownAt) {
+    Invoke-Safely -Name 'Summary' -Block { Complete-Run }
+}
 
 Write-Host ""
 Pink  "  =================================================="
 Pink  "   Lerxna Optimizer - Complete!"
 Pink  "  =================================================="
 Write-Host ""
+# Keep the window open so the summary can be read (it would close instantly otherwise)
+try { Read-Host "  Press Enter to close" | Out-Null } catch {}

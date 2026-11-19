@@ -5,12 +5,37 @@ A Windows 10 / 11 optimizer that **asks you Y/N before every change** and only a
 
 ## How to run
 
-1. Download `LerxnaOptimizer.ps1`
-2. Right-click it > **Run with PowerShell** (it will ask for Administrator), or from an admin PowerShell:
+1. Download **both** `Run-LerxnaOptimizer.bat` and `LerxnaOptimizer.ps1` into the same folder (if you downloaded a .zip, extract it first)
+2. Double-click **`Run-LerxnaOptimizer.bat`** and click **Yes** when Windows asks for Administrator
+
+Other ways that also work:
+- Right-click `LerxnaOptimizer.ps1` > **Run with PowerShell**
+- From any PowerShell window:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\LerxnaOptimizer.ps1
 ```
+
+## Works on
+
+| | |
+|---|---|
+| Windows 11 / Windows 10 (Home, Pro, Education, Enterprise, LTSC) | Fully supported |
+| Windows 8.1 | Best effort - needs Windows Management Framework 5.1 installed (Win10/11-only options are hidden) |
+| Windows Server 2016+ | Works; options that don't exist there (Store apps, Xbox) are hidden |
+| Intel, AMD and ARM64 PCs, laptops and desktops, VMs | Supported |
+| Windows 7 / 8 | Not supported - shows a message and exits |
+
+It takes care of the usual problems by itself:
+- Not run as admin: asks for Administrator rights and relaunches
+- Opened in PowerShell 7 or 32-bit PowerShell: relaunches in 64-bit Windows PowerShell 5.1 (32-bit would save settings to the wrong place)
+- Script on a network drive: copies itself locally first (admin windows can't see mapped drives)
+- Script blocking (execution policy): bypassed for this run only by the launcher
+- Missing Windows features or broken WMI: falls back or skips that part instead of crashing; any error returns you to the menu
+- Small console window: tables shrink to fit
+- Window stays open at the end so you can read the summary
+
+Won't run on PCs where IT has locked PowerShell down (Constrained Language Mode - it tells you so) or in Windows S mode (Windows blocks PowerShell entirely there).
 
 ## What it does
 
