@@ -1,11 +1,19 @@
 name: Release
 
-# Push a version tag (for example v2.1) to build a single zip with
-# everything in it and publish it as a GitHub Release.
+# Build a single zip with everything in it and publish it as a GitHub Release.
+# Two ways to start it:
+#  - push a version tag, e.g. v2.1
+#  - Actions tab > Release > Run workflow, and type the version (e.g. v2.1);
+#    the tag is then created on the latest commit automatically
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, for example v2.1'
+        required: true
 
 permissions:
   contents: write
@@ -14,12 +22,18 @@ jobs:
   release:
     runs-on: windows-latest
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ github.event.inputs.version || github.ref_name }}
+      TARGET: ${{ github.sha }}
       # Code signing is optional: it only runs once the two secrets below are added
       # (repo Settings > Secrets and variables > Actions).
       HAS_CERT: ${{ secrets.SIGNING_CERT_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check the version name
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v\d+(\.\d+){0,3}$') { "::error::Version must look like v2.1 (got '$env:TAG')"; exit 1 }
 
       - name: Self-test before releasing
         shell: powershell
@@ -64,4 +78,4 @@ jobs:
           2. Right-click it > **Extract All** (don't run it from inside the zip)
           3. Double-click **Run-LerxnaOptimizer.bat** (or **Preview-LerxnaOptimizer.bat** to see what it would change without changing anything)
           "@
-          gh release create "$env:TAG" "dist/LerxnaOptimizer-$env:TAG.zip" --title "Lerxna Optimizer $env:TAG" --notes "$notes" --generate-notes
+          gh release create "$env:TAG" "dist/LerxnaOptimizer-$env:TAG.zip" --target "$env:TARGET" --title "Lerxna Optimizer $env:TAG" --notes "$notes" --generate-notes

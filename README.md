@@ -99,6 +99,6 @@ Every push runs on a real Windows machine (GitHub Actions, `windows-latest`):
 3. A round trip that **applies every tweak, undoes it, and checks that every single setting is back to its original value** (`-SelfTest -RoundTrip`)
 
 ## Releases
-Pushing a version tag such as `v2.1` builds the zip and publishes it on the Releases page automatically.
+To publish a release: **Actions > Release > Run workflow**, type the version (e.g. `v2.2`), and it tests the script, builds the zip and publishes it on the Releases page. Pushing a `v*` tag does the same.
 
 **Code signing (optional):** some antivirus programs are suspicious of unsigned "optimizer" scripts. To sign releases, get a code signing certificate (for example an OV certificate from a certificate authority, or Microsoft's Azure Trusted Signing), export it as a .pfx, and add two repository secrets: `SIGNING_CERT_BASE64` (the .pfx encoded as base64) and `SIGNING_CERT_PASSWORD`. The release workflow then signs `LerxnaOptimizer.ps1` automatically. Without them, releases are simply unsigned.
