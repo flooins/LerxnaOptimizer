@@ -1,7 +1,20 @@
 # ============================================================
-#            Lerxna Optimizer v2.0 - Windows Setup Script
+#            Lerxna Optimizer v2.1 - Windows Setup Script
 #                    Run as Administrator
 # ============================================================
+#  Usage
+#   .\LerxnaOptimizer.ps1             normal (asks before every change)
+#   .\LerxnaOptimizer.ps1 -Preview    shows every change it WOULD make,
+#                                     changes nothing
+#   .\LerxnaOptimizer.ps1 -SelfTest   automated test, used by GitHub
+#                                     Actions (add -RoundTrip to apply
+#                                     every tweak, undo it and verify)
+#
+#  What's new in v2.1
+#   - Every tweak can be undone on its own: old values are saved
+#     before anything is changed
+#   - Preview mode
+#
 #  What's new in v2.0
 #   - Scans your PC first (Windows version, CPU/GPU, RAM, disk,
 #     laptop/desktop, installed games, startup apps) and only
@@ -16,6 +29,12 @@
 #   - Junk file cleanup, restore point, undo menu, log file
 # ============================================================
 
+param(
+    [switch]$Preview,
+    [switch]$SelfTest,
+    [switch]$RoundTrip
+)
+
 # ------------------------------------------------------------
 # Compatibility checks + relaunch
 # This part only uses very basic PowerShell so it can show a clear
@@ -26,7 +45,7 @@ function Stop-WithMessage {
     Write-Host ""
     Write-Host "  $Message" -ForegroundColor Red
     Write-Host ""
-    try { Read-Host "  Press Enter to close" | Out-Null } catch {}
+    if (-not $SelfTest) { try { Read-Host "  Press Enter to close" | Out-Null } catch {} }
     exit 1
 }
 
@@ -53,7 +72,10 @@ $IsCore    = $PSVersionTable.PSEdition -eq 'Core'
 # 32-bit PowerShell on 64-bit Windows writes registry settings to the wrong place
 $Is32On64  = [Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess
 
-if (-not $IsAdmin -or $IsCore -or $Is32On64) {
+if ($SelfTest) {
+    # Automated test: never relaunch (that would hide the result); just require admin
+    if (-not $IsAdmin) { Stop-WithMessage "-SelfTest must run as Administrator." }
+} elseif (-not $IsAdmin -or $IsCore -or $Is32On64) {
     # Relaunch in 64-bit Windows PowerShell 5.1, as Administrator
     $psExe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if ($Is32On64) { $psExe = Join-Path $env:windir 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' }
@@ -75,6 +97,7 @@ if (-not $IsAdmin -or $IsCore -or $Is32On64) {
         }
 
         $launchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptPath`"")
+        if ($Preview) { $launchArgs += '-Preview' }
         try {
             if ($IsAdmin) { Start-Process -FilePath $psExe -ArgumentList $launchArgs -ErrorAction Stop }
             else          { Start-Process -FilePath $psExe -ArgumentList $launchArgs -Verb RunAs -ErrorAction Stop }
@@ -90,7 +113,7 @@ if (-not $IsAdmin -or $IsCore -or $Is32On64) {
 }
 
 $ProgressPreference = 'SilentlyContinue'
-try { $Host.UI.RawUI.WindowTitle = 'Lerxna Optimizer v2.0' } catch {}
+try { $Host.UI.RawUI.WindowTitle = 'Lerxna Optimizer v2.1' } catch {}
 # Make the window wide enough for the tables (silently ignored where not possible, e.g. Windows Terminal)
 try {
     $raw = $Host.UI.RawUI
@@ -103,12 +126,20 @@ try {
 # ------------------------------------------------------------
 # Globals
 # ------------------------------------------------------------
-$Script:Version   = '2.0'
+$Script:Version   = '2.1'
 $Script:DataDir   = Join-Path $env:ProgramData 'LerxnaOptimizer'
 try { New-Item -ItemType Directory -Path $Script:DataDir -Force -ErrorAction Stop | Out-Null }
 catch { $Script:DataDir = $env:TEMP }
 $Script:LogFile    = Join-Path $Script:DataDir ("log_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 $Script:BackupFile = Join-Path $Script:DataDir 'startup_backup.json'
+$Script:JournalFile = Join-Path $Script:DataDir 'tweaks_backup.json'   # old values of every tweak, for Undo
+
+# Preview mode: show what would change, change nothing
+$Script:Preview        = [bool]$Preview
+$Script:NonInteractive = [bool]$SelfTest
+$Script:PreviewLog     = New-Object System.Collections.Generic.List[string]
+$Script:Previewed      = New-Object System.Collections.Generic.List[string]
+$Script:CurrentRecord  = $null    # the tweak whose changes are being recorded right now
 
 $Script:Applied  = New-Object System.Collections.Generic.List[string]
 $Script:Skipped  = New-Object System.Collections.Generic.List[string]
@@ -183,6 +214,7 @@ function Format-Size {
 # Yes/No question. Tag: REC (green), CAUTION (yellow), CHOICE (cyan)
 function Ask {
     param([string]$Question, [string]$Tag = '', [string]$Note = '')
+    if ($Script:NonInteractive) { Write-Log "ASK (auto-no): $Question"; return $false }
     Write-Host ""
     Write-Host "  >> $Question" -ForegroundColor Magenta -NoNewline
     switch ($Tag) {
@@ -206,6 +238,7 @@ function Ask {
 # Menu choice - returns the (upper-case) choice
 function Read-Choice {
     param([string]$Prompt, [string[]]$Valid)
+    if ($Script:NonInteractive) { return '0' }
     while ($true) {
         Write-Host ""
         Write-Host "  $Prompt " -ForegroundColor White -NoNewline
@@ -233,18 +266,22 @@ function Parse-Selection {
     return $result.ToArray()
 }
 
-# ------------------------------------------------------------
-# Registry / service / task helpers
-# ------------------------------------------------------------
-function Set-Reg {
-    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
-    try {
-        if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
-        New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction Stop | Out-Null
-        Write-Log "REG $Path\$Name = $Value ($Type)"
-    } catch {
-        Write-Log "REG FAILED $Path\$Name : $($_.Exception.Message)"
-    }
+# ============================================================
+# CHANGE ENGINE
+# Every change the optimizer makes goes through these functions.
+#  - Preview mode: they print what WOULD change and change nothing.
+#  - Normal mode : they save the old value to the undo journal
+#                  (tweaks_backup.json) and then make the change,
+#                  so every tweak can be undone on its own later.
+# ============================================================
+$Script:GuidPattern  = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+$Script:ChangeErrors = 0
+
+function Add-PreviewLine {
+    param([string]$Verb, [string]$Text)
+    $color = if ($Verb -eq 'no change') { 'DarkGray' } else { 'Cyan' }
+    Write-Host ("       [{0}] {1}" -f $Verb, $Text) -ForegroundColor $color
+    $Script:PreviewLog.Add(("    [{0}] {1}" -f $Verb, $Text))
 }
 
 function Get-RegValue {
@@ -255,61 +292,584 @@ function Get-RegValue {
     } catch { return $null }
 }
 
-function Set-ServiceStartup {
-    param([string]$Name, [ValidateSet('Disabled', 'Manual', 'Automatic')][string]$Type, [switch]$Stop)
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return }
-    if ($Stop) { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
-    try {
-        Set-Service -Name $Name -StartupType $Type -ErrorAction Stop
-        Write-Log "SERVICE $Name -> $Type"
-    } catch {
-        $startValue = @{ 'Disabled' = 4; 'Manual' = 3; 'Automatic' = 2 }[$Type]
-        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" 'Start' $startValue
+# ---------------- registry (via .NET, so every value type and the default value work) ----------------
+function Split-RegPath {
+    param([string]$Path)
+    if (-not ($Path -match '^(HKCU|HKLM|HKU|HKCR):\\?(.*)$')) { throw "Unsupported registry path: $Path" }
+    $root = $Matches[1]
+    $sub  = $Matches[2].TrimEnd('\')
+    $hive = switch ($root) {
+        'HKCU' { [Microsoft.Win32.RegistryHive]::CurrentUser }
+        'HKLM' { [Microsoft.Win32.RegistryHive]::LocalMachine }
+        'HKU'  { [Microsoft.Win32.RegistryHive]::Users }
+        'HKCR' { [Microsoft.Win32.RegistryHive]::ClassesRoot }
+    }
+    return @{ Root = $root; Hive = $hive; Sub = $sub; Display = "$root\$sub" }
+}
+
+function Open-RegKey {
+    param([string]$Path, [switch]$Write, [switch]$Create)
+    $p = Split-RegPath $Path
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($p.Hive, [Microsoft.Win32.RegistryView]::Default)
+    if ($Create) { return $base.CreateSubKey($p.Sub) }
+    return $base.OpenSubKey($p.Sub, [bool]$Write)
+}
+
+function Test-RegKey {
+    param([string]$Path)
+    $k = $null
+    try { $k = Open-RegKey $Path } catch {}
+    if ($k) { $k.Close(); return $true }
+    return $false
+}
+
+# DWORDs above 2147483647 (like 0xFFFFFFFF) have to be stored as negative Int32
+function ConvertTo-Int32Bits {
+    param($Value)
+    $n = [int64]$Value
+    if ($n -gt [int32]::MaxValue) { $n = $n - 4294967296 }
+    return [int32]$n
+}
+
+function ConvertTo-RegData {
+    param($Value, [string]$Kind)
+    switch ($Kind) {
+        'DWord'       { return (ConvertTo-Int32Bits $Value) }
+        'QWord'       { return [int64]$Value }
+        'Binary'      {
+            if ($null -eq $Value) { return , ([byte[]]@()) }
+            return , ([byte[]]@($Value | ForEach-Object { [byte]$_ }))
+        }
+        'MultiString' {
+            if ($null -eq $Value) { return , ([string[]]@()) }
+            return , ([string[]]@($Value))
+        }
+        default       { return [string]$Value }
     }
 }
 
+# Byte arrays are saved as plain numbers in the JSON journal
+function ConvertTo-JournalData {
+    param($Value, [string]$Kind)
+    if ($null -eq $Value) { return $null }
+    if ($Kind -eq 'Binary')      { return , ([int[]]@($Value | ForEach-Object { [int]$_ })) }
+    if ($Kind -eq 'MultiString') { return , ([string[]]@($Value)) }
+    return $Value
+}
+
+function Format-RegData {
+    param($Value, [string]$Kind)
+    switch ($Kind) {
+        'DWord' {
+            $u = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32](ConvertTo-Int32Bits $Value)), 0)
+            return ('{0} (0x{0:X})' -f $u)
+        }
+        'QWord'       { return [string]$Value }
+        'Binary'      { return ((@($Value) | ForEach-Object { '{0:X2}' -f [int]$_ }) -join ' ') }
+        'MultiString' { return ('"' + (@($Value) -join '", "') + '"') }
+        default       { return ('"' + [string]$Value + '"') }
+    }
+}
+
+function Test-RegDataEqual {
+    param($A, $B, [string]$Kind)
+    return ((Format-RegData $A $Kind) -ceq (Format-RegData $B $Kind))
+}
+
+function Get-RegState {
+    param([string]$Path, [string]$Name)
+    $st = @{ KeyExists = $false; Exists = $false; Kind = $null; Value = $null }
+    $k = $null
+    try { $k = Open-RegKey $Path } catch {}
+    if ($k) {
+        try {
+            $st.KeyExists = $true
+            if (@($k.GetValueNames()) -contains $Name) {
+                $st.Exists = $true
+                $st.Kind   = [string]$k.GetValueKind($Name)
+                $st.Value  = $k.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            }
+        } catch {} finally { $k.Close() }
+    }
+    return $st
+}
+
+function Format-RegState {
+    param($State)
+    if (-not $State.Exists) { return 'not set' }
+    return (Format-RegData $State.Value $State.Kind)
+}
+
+function Get-RegLabel {
+    param([string]$Path, [string]$Name)
+    $n = if ($Name) { $Name } else { '(Default)' }
+    return ('{0}\{1}' -f (Split-RegPath $Path).Display, $n)
+}
+
+# The first key in the path that doesn't exist yet (so Undo can remove what we created)
+function Get-MissingKeyRoot {
+    param([string]$Path)
+    $p = Split-RegPath $Path
+    $cur = ''
+    foreach ($part in @($p.Sub -split '\\' | Where-Object { $_ })) {
+        $cur = if ($cur) { "$cur\$part" } else { $part }
+        $test = "$($p.Root):\$cur"
+        if (-not (Test-RegKey $test)) { return $test }
+    }
+    return $null
+}
+
+function Write-RegData {
+    param([string]$Path, [string]$Name, $Value, [string]$Kind)
+    $k = Open-RegKey $Path -Create
+    if (-not $k) { throw "Could not open $Path" }
+    try { $k.SetValue($Name, (ConvertTo-RegData $Value $Kind), [Microsoft.Win32.RegistryValueKind]$Kind) }
+    finally { $k.Close() }
+}
+
+function Remove-RegData {
+    param([string]$Path, [string]$Name)
+    $k = Open-RegKey $Path -Write
+    if ($k) { try { $k.DeleteValue($Name, $false) } finally { $k.Close() } }
+}
+
+function Test-RegTreeEmpty {
+    param($Key)
+    if ($Key.ValueCount -gt 0) { return $false }
+    foreach ($n in $Key.GetSubKeyNames()) {
+        $sk = $Key.OpenSubKey($n)
+        if ($sk) {
+            $empty = Test-RegTreeEmpty $sk
+            $sk.Close()
+            if (-not $empty) { return $false }
+        }
+    }
+    return $true
+}
+
+# Deletes a key we created, but only if nothing has been put in it since
+function Remove-RegTreeIfEmpty {
+    param([string]$Path)
+    $k = $null
+    try { $k = Open-RegKey $Path } catch {}
+    if (-not $k) { return }
+    $empty = Test-RegTreeEmpty $k
+    $k.Close()
+    if (-not $empty) { return }
+    $p = Split-RegPath $Path
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($p.Hive, [Microsoft.Win32.RegistryView]::Default)
+    $base.DeleteSubKeyTree($p.Sub, $false)
+}
+
+# Used by every tweak to set a registry value
+function Set-Reg {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+    $label = Get-RegLabel $Path $Name
+    $old   = Get-RegState $Path $Name
+    $same  = $old.Exists -and $old.Kind -eq $Type -and (Test-RegDataEqual $old.Value $Value $Type)
+    if ($Script:Preview) {
+        if ($same) { Add-PreviewLine 'no change' "$label is already $(Format-RegData $Value $Type)" }
+        else       { Add-PreviewLine 'would set' "$label = $(Format-RegData $Value $Type)   (now: $(Format-RegState $old))" }
+        return
+    }
+    if ($same) { Write-Log "REG unchanged $label"; return }
+    try {
+        $created = if ($old.KeyExists) { $null } else { Get-MissingKeyRoot $Path }
+        Write-RegData $Path $Name $Value $Type
+        Save-JournalChange @{ Kind = 'Reg'; Path = $Path; Name = $Name; Existed = $old.Exists; OldKind = $old.Kind
+                              OldValue = (ConvertTo-JournalData $old.Value $old.Kind); CreatedKey = $created }
+        Write-Log "REG $label = $(Format-RegData $Value $Type) (was: $(Format-RegState $old))"
+    } catch {
+        Write-Log "REG FAILED $label : $($_.Exception.Message)"
+        $Script:ChangeErrors++
+    }
+}
+
+# Used by tweaks to delete a registry value
+function Remove-Reg {
+    param([string]$Path, [string]$Name)
+    $label = Get-RegLabel $Path $Name
+    $old   = Get-RegState $Path $Name
+    if (-not $old.Exists) {
+        if ($Script:Preview) { Add-PreviewLine 'no change' "$label is not set" }
+        return
+    }
+    if ($Script:Preview) { Add-PreviewLine 'would delete' "$label   (now: $(Format-RegState $old))"; return }
+    try {
+        Remove-RegData $Path $Name
+        Save-JournalChange @{ Kind = 'Reg'; Path = $Path; Name = $Name; Existed = $true; OldKind = $old.Kind
+                              OldValue = (ConvertTo-JournalData $old.Value $old.Kind); CreatedKey = $null }
+        Write-Log "REG deleted $label (was: $(Format-RegState $old))"
+    } catch {
+        Write-Log "REG DELETE FAILED $label : $($_.Exception.Message)"
+        $Script:ChangeErrors++
+    }
+}
+
+# ---------------- services ----------------
+function Get-ServiceState {
+    param([string]$Name)
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $svc) { return $null }
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
+    $start = Get-RegValue $key 'Start'
+    if ($null -eq $start) { $start = 3 }
+    return @{
+        Start   = [int]$start
+        Delayed = ([int](Get-RegValue $key 'DelayedAutostart') -eq 1)
+        Running = ($svc.Status -eq 'Running')
+    }
+}
+
+function Format-StartType {
+    param($State)
+    switch ([int]$State.Start) {
+        2       { if ($State.Delayed) { return 'Automatic (delayed)' } else { return 'Automatic' } }
+        3       { return 'Manual' }
+        4       { return 'Disabled' }
+        default { return 'Boot/System' }
+    }
+}
+
+function Set-ServiceStartup {
+    param([string]$Name, [ValidateSet('Disabled', 'Manual', 'Automatic')][string]$Type, [switch]$Stop)
+    $st = Get-ServiceState $Name
+    if (-not $st) {
+        if ($Script:Preview) { Add-PreviewLine 'no change' "service $Name is not installed" }
+        return
+    }
+    $target   = @{ 'Disabled' = 4; 'Manual' = 3; 'Automatic' = 2 }[$Type]
+    $willStop = $Stop -and $st.Running
+    $same     = ($st.Start -eq $target) -and -not $willStop
+    $now      = Format-StartType $st
+    if ($st.Running) { $now += ', running' }
+    if ($Script:Preview) {
+        if ($same) { Add-PreviewLine 'no change' "service $Name is already $Type" }
+        else {
+            $extra = if ($willStop) { ' and stop it now' } else { '' }
+            Add-PreviewLine 'would set' "service $Name startup = $Type$extra   (now: $now)"
+        }
+        return
+    }
+    if ($same) { return }
+    Save-JournalChange @{ Kind = 'Service'; Name = $Name; OldStart = $st.Start; OldDelayed = $st.Delayed; WasRunning = $st.Running }
+    if ($willStop) { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
+    if ($st.Start -ne $target) {
+        try { Set-Service -Name $Name -StartupType $Type -ErrorAction Stop }
+        catch {
+            try { Write-RegData "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" 'Start' $target 'DWord' }
+            catch { $Script:ChangeErrors++; Write-Log "SERVICE FAILED $Name : $($_.Exception.Message)"; return }
+        }
+    }
+    Write-Log "SERVICE $Name -> $Type (was: $now)"
+}
+
+function Restore-ServiceState {
+    param($Change)
+    $name  = [string]$Change.Name
+    $start = [int]$Change.OldStart
+    $key   = "HKLM:\SYSTEM\CurrentControlSet\Services\$name"
+    $type  = switch ($start) { 2 { 'Automatic' } 3 { 'Manual' } 4 { 'Disabled' } default { $null } }
+    $ok = $false
+    if ($type) { try { Set-Service -Name $name -StartupType $type -ErrorAction Stop; $ok = $true } catch {} }
+    if (-not $ok) { Write-RegData $key 'Start' $start 'DWord' }
+    if ($start -eq 2 -and $Change.OldDelayed) { Write-RegData $key 'DelayedAutostart' 1 'DWord' }
+    if ($Change.WasRunning) { Start-Service -Name $name -ErrorAction SilentlyContinue }
+}
+
+# ---------------- scheduled tasks ----------------
 function Disable-TaskSafe {
     param([string]$TaskPath, [string]$TaskName)
     if (-not $Script:Has.Tasks) { return }
     $t = $null
     try { $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop } catch {}
-    if ($t -and $t.State -ne 'Disabled') {
-        try {
-            $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null
-            Write-Log "TASK disabled $TaskPath$TaskName"
-        } catch { Write-Log "TASK FAILED $TaskPath$TaskName : $($_.Exception.Message)" }
+    if (-not $t) {
+        if ($Script:Preview) { Add-PreviewLine 'no change' "scheduled task $TaskPath$TaskName doesn't exist here" }
+        return
     }
+    if ($t.State -eq 'Disabled') {
+        if ($Script:Preview) { Add-PreviewLine 'no change' "scheduled task $TaskPath$TaskName is already disabled" }
+        return
+    }
+    if ($Script:Preview) { Add-PreviewLine 'would disable' "scheduled task $TaskPath$TaskName   (now: $($t.State))"; return }
+    try {
+        $t | Disable-ScheduledTask -ErrorAction Stop | Out-Null
+        Save-JournalChange @{ Kind = 'Task'; TaskPath = $TaskPath; TaskName = $TaskName }
+        Write-Log "TASK disabled $TaskPath$TaskName"
+    } catch {
+        Write-Log "TASK FAILED $TaskPath$TaskName : $($_.Exception.Message)"
+        $Script:ChangeErrors++
+    }
+}
+
+# ---------------- power ----------------
+function Get-ActivePowerScheme {
+    $out = (powercfg /getactivescheme 2>$null) -join ' '
+    if ($out -match "($Script:GuidPattern)\s*\(([^)]*)\)") { return @{ Guid = $Matches[1]; Name = $Matches[2] } }
+    if ($out -match "($Script:GuidPattern)") { return @{ Guid = $Matches[1]; Name = $Matches[1] } }
+    return $null
 }
 
 function Set-PowerScheme {
     param([string]$Guid, [string]$Label)
+    $current = Get-ActivePowerScheme
+    if ($Script:Preview) {
+        $nowName = if ($current) { $current.Name } else { 'unknown' }
+        Add-PreviewLine 'would set' "power plan = $Label   (now: $nowName)"
+        return $true
+    }
     $list = (powercfg /list) -join "`n"
     $target = $null
     if ($list -match [regex]::Escape($Guid)) {
         $target = $Guid
     } else {
         foreach ($line in ($list -split "`n")) {
-            if ($line -match [regex]::Escape($Label) -and $line -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-                $target = $Matches[1]; break
-            }
+            if ($line -match [regex]::Escape($Label) -and $line -match "($Script:GuidPattern)") { $target = $Matches[1]; break }
         }
         if (-not $target) {
             $out = (powercfg /duplicatescheme $Guid 2>&1) -join ' '
-            if ($out -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') { $target = $Matches[1] }
+            if ($out -match "($Script:GuidPattern)") { $target = $Matches[1] }
         }
     }
     if (-not $target) { return $false }
+    if ($current -and $current.Guid -eq $target) { return $true }
     powercfg /setactive $target | Out-Null
-    return ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -ne 0) { return $false }
+    if ($current) { Save-JournalChange @{ Kind = 'Power'; OldScheme = $current.Guid; OldName = $current.Name } }
+    Write-Log "POWER plan -> $Label (was: $(if ($current) { $current.Name }))"
+    return $true
+}
+
+# Reads the "plugged in" value of a power setting, in seconds
+function Get-PowerValueAC {
+    param([string]$Scheme, [string]$Sub, [string]$Setting)
+    $hex = @()
+    foreach ($l in @(powercfg /query $Scheme $Sub $Setting 2>$null)) {
+        if ($l -match '0x([0-9a-fA-F]+)\s*$') { $hex += $Matches[1] }
+    }
+    # Last two values are "Current AC" and "Current DC"
+    if ($hex.Count -ge 2) { return [Convert]::ToInt64($hex[-2], 16) }
+    return $null
+}
+
+function Format-Timeout {
+    param($Seconds)
+    if ($null -eq $Seconds) { return 'unknown' }
+    if ([int64]$Seconds -eq 0) { return 'never' }
+    return ('{0} min' -f [math]::Round([int64]$Seconds / 60))
+}
+
+# Sets how long until sleep/hibernate when plugged in (0 = never)
+function Set-PowerTimeoutAC {
+    param([ValidateSet('STANDBYIDLE', 'HIBERNATEIDLE')][string]$Setting, [string]$Label, [int]$Seconds)
+    $scheme = Get-ActivePowerScheme
+    if (-not $scheme) { return }
+    $old = Get-PowerValueAC $scheme.Guid 'SUB_SLEEP' $Setting
+    $same = ($null -ne $old) -and ([int64]$old -eq $Seconds)
+    if ($Script:Preview) {
+        if ($same) { Add-PreviewLine 'no change' "$Label (plugged in) is already $(Format-Timeout $Seconds)" }
+        else       { Add-PreviewLine 'would set' "$Label (plugged in) = $(Format-Timeout $Seconds)   (now: $(Format-Timeout $old))" }
+        return
+    }
+    if ($same) { return }
+    powercfg /setacvalueindex $scheme.Guid SUB_SLEEP $Setting $Seconds | Out-Null
+    powercfg /setactive $scheme.Guid | Out-Null
+    if ($null -ne $old) { Save-JournalChange @{ Kind = 'PowerValue'; Scheme = $scheme.Guid; Sub = 'SUB_SLEEP'; Setting = $Setting; OldAC = $old } }
+    Write-Log "POWER $Setting AC = $Seconds (was: $old)"
+}
+
+function Get-HibernateOn {
+    $v = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled'
+    if ($null -ne $v) { return ([int]$v -eq 1) }
+    return [bool](Get-Item -LiteralPath "$env:SystemDrive\hiberfil.sys" -Force -ErrorAction SilentlyContinue)
+}
+
+function Set-Hibernation {
+    param([bool]$On)
+    $was = Get-HibernateOn
+    $word = if ($On) { 'on' } else { 'off' }
+    if ($Script:Preview) {
+        if ($was -eq $On) { Add-PreviewLine 'no change' "hibernation is already $word" }
+        else { Add-PreviewLine 'would run' "powercfg /h $word   (hibernation is now $(if ($was) { 'on' } else { 'off' }))" }
+        return
+    }
+    if ($was -eq $On) { return }
+    powercfg /h $word | Out-Null
+    Save-JournalChange @{ Kind = 'Hibernate'; WasOn = $was }
+    Write-Log "POWER hibernation $word"
+}
+
+# ---------------- things that can't be undone automatically ----------------
+function Invoke-Step {
+    param([string]$Description, [scriptblock]$Block)
+    if ($Script:Preview) { Add-PreviewLine 'would run' $Description; return }
+    & $Block
+    Save-JournalChange @{ Kind = 'Note'; Text = $Description }
+    Write-Log "STEP $Description"
 }
 
 function Restart-Explorer {
+    $Script:NeedsExplorerRestart = $false
+    if ($Script:Preview -or $Script:NonInteractive) { return }
     Pink "`n  Restarting Explorer to apply visual changes..."
     Stop-Process -Name 'explorer' -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     if (-not (Get-Process -Name 'explorer' -ErrorAction SilentlyContinue)) { Start-Process 'explorer.exe' }
-    $Script:NeedsExplorerRestart = $false
+}
+
+# ============================================================
+# UNDO JOURNAL
+# One record per tweak: { Title, Date, Explorer, Changes[] }
+# ============================================================
+function Get-TweakJournal {
+    if (-not (Test-Path -LiteralPath $Script:JournalFile)) { return @() }
+    try {
+        $data = Get-Content -LiteralPath $Script:JournalFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        return @($data)
+    } catch { return @() }
+}
+
+function Save-TweakJournal {
+    param($Records)
+    $arr = @($Records | Where-Object { $_ })
+    if ($arr.Count -eq 0) { Remove-Item -LiteralPath $Script:JournalFile -Force -ErrorAction SilentlyContinue; return }
+    ConvertTo-Json -InputObject $arr -Depth 8 | Set-Content -LiteralPath $Script:JournalFile -Encoding UTF8
+}
+
+function Start-TweakRecord {
+    param([string]$Title, [bool]$Explorer)
+    $Script:CurrentRecord = $null
+    if ($Script:Preview) { return }
+    $existing = @(Get-TweakJournal | Where-Object { $_.Title -eq $Title }) | Select-Object -First 1
+    $changes = @()
+    if ($existing) { $changes = @($existing.Changes | Where-Object { $_ }) }
+    $Script:CurrentRecord = [pscustomobject]@{
+        Title = $Title; Date = (Get-Date).ToString('yyyy-MM-dd HH:mm'); Explorer = $Explorer; Changes = $changes
+    }
+}
+
+function Get-ChangeId {
+    param($Change)
+    switch ($Change.Kind) {
+        'Reg'        { return ("Reg|{0}|{1}" -f $Change.Path, $Change.Name).ToLower() }
+        'Service'    { return ("Service|{0}" -f $Change.Name).ToLower() }
+        'Task'       { return ("Task|{0}{1}" -f $Change.TaskPath, $Change.TaskName).ToLower() }
+        'Power'      { return 'Power|scheme' }
+        'PowerValue' { return ("PowerValue|{0}|{1}" -f $Change.Scheme, $Change.Setting).ToLower() }
+        'Hibernate'  { return 'Hibernate' }
+        default      { return ("Note|{0}" -f $Change.Text) }
+    }
+}
+
+function Save-JournalChange {
+    param([hashtable]$Change)
+    if (-not $Script:CurrentRecord) { return }
+    $id = Get-ChangeId $Change
+    # If this tweak was applied before, keep the ORIGINAL value from the first time
+    if (@($Script:CurrentRecord.Changes | Where-Object { $_.Id -eq $id }).Count -gt 0) { return }
+    $Change.Id = $id
+    $Script:CurrentRecord.Changes = @($Script:CurrentRecord.Changes) + @([pscustomobject]$Change)
+    # Saved straight away, so even if something crashes halfway the change can still be undone
+    $others = @(Get-TweakJournal | Where-Object { $_.Title -ne $Script:CurrentRecord.Title })
+    Save-TweakJournal (@($others) + @($Script:CurrentRecord))
+}
+
+function Get-ChangeDescription {
+    param($Change)
+    switch ($Change.Kind) {
+        'Reg' {
+            $label = Get-RegLabel $Change.Path $Change.Name
+            if ($Change.Existed) { return "restore $label = $(Format-RegData (ConvertTo-RegData $Change.OldValue $Change.OldKind) $Change.OldKind)" }
+            return "delete $label (it didn't exist before)"
+        }
+        'Service' {
+            $st = @{ Start = [int]$Change.OldStart; Delayed = [bool]$Change.OldDelayed }
+            $extra = if ($Change.WasRunning) { ' and start it' } else { '' }
+            return "set service $($Change.Name) back to $(Format-StartType $st)$extra"
+        }
+        'Task'       { return "re-enable scheduled task $($Change.TaskPath)$($Change.TaskName)" }
+        'Power'      { return "switch the power plan back to $($Change.OldName)" }
+        'PowerValue' { return "set $($Change.Setting) (plugged in) back to $(Format-Timeout $Change.OldAC)" }
+        'Hibernate'  { return "turn hibernation back $(if ($Change.WasOn) { 'on' } else { 'off' })" }
+        default      { return [string]$Change.Text }
+    }
+}
+
+function Undo-Change {
+    param($Change)
+    switch ($Change.Kind) {
+        'Reg' {
+            if ($Change.Existed) {
+                Write-RegData $Change.Path $Change.Name (ConvertTo-RegData $Change.OldValue $Change.OldKind) $Change.OldKind
+            } else {
+                Remove-RegData $Change.Path $Change.Name
+                if ($Change.CreatedKey) { Remove-RegTreeIfEmpty $Change.CreatedKey }
+            }
+        }
+        'Service'    { Restore-ServiceState $Change }
+        'Task'       { Enable-ScheduledTask -TaskPath $Change.TaskPath -TaskName $Change.TaskName -ErrorAction Stop | Out-Null }
+        'Power'      { powercfg /setactive $Change.OldScheme | Out-Null }
+        'PowerValue' {
+            powercfg /setacvalueindex $Change.Scheme $Change.Sub $Change.Setting $Change.OldAC | Out-Null
+            $cur = Get-ActivePowerScheme
+            if ($cur) { powercfg /setactive $cur.Guid | Out-Null }
+        }
+        'Hibernate'  { powercfg /h $(if ($Change.WasOn) { 'on' } else { 'off' }) | Out-Null }
+    }
+}
+
+# Undoes one tweak (all its changes, newest first). Returns how many changes failed.
+function Undo-TweakRecord {
+    param($Record)
+    $changes = @($Record.Changes | Where-Object { $_ })
+    [array]::Reverse($changes)
+    $fails = 0
+    $notes = @()
+    foreach ($c in $changes) {
+        if ($c.Kind -eq 'Note') { $notes += [string]$c.Text; continue }
+        $desc = Get-ChangeDescription $c
+        if ($Script:Preview) { Add-PreviewLine 'would' $desc; continue }
+        try { Undo-Change $c; Write-Log "UNDO $desc" }
+        catch {
+            $fails++
+            Write-Log "UNDO FAILED $desc : $($_.Exception.Message)"
+            Warn "Couldn't $desc ($($_.Exception.Message))"
+        }
+    }
+    foreach ($n in $notes) { Info "Can't be undone automatically: $n" }
+    if (-not $Script:Preview) {
+        Save-TweakJournal @(Get-TweakJournal | Where-Object { $_.Title -ne $Record.Title })
+        if ($Record.Explorer) { $Script:NeedsExplorerRestart = $true }
+    }
+    return $fails
+}
+
+# Used by the self-test: is this change back to how it was?
+function Test-ChangeRestored {
+    param($Change)
+    switch ($Change.Kind) {
+        'Reg' {
+            $now = Get-RegState $Change.Path $Change.Name
+            if ($Change.Existed) {
+                return ($now.Exists -and $now.Kind -eq $Change.OldKind -and
+                        (Test-RegDataEqual $now.Value (ConvertTo-RegData $Change.OldValue $Change.OldKind) $Change.OldKind))
+            }
+            return (-not $now.Exists)
+        }
+        'Service' {
+            $now = Get-ServiceState $Change.Name
+            return ($null -ne $now -and $now.Start -eq [int]$Change.OldStart)
+        }
+        'Task' {
+            $t = $null
+            try { $t = Get-ScheduledTask -TaskPath $Change.TaskPath -TaskName $Change.TaskName -ErrorAction Stop } catch {}
+            return ($null -ne $t -and $t.State -ne 'Disabled')
+        }
+        'Power'      { $cur = Get-ActivePowerScheme; return ($null -ne $cur -and $cur.Guid -eq $Change.OldScheme) }
+        'PowerValue' { return ((Get-PowerValueAC $Change.Scheme $Change.Sub $Change.Setting) -eq [int64]$Change.OldAC) }
+        'Hibernate'  { return ((Get-HibernateOn) -eq [bool]$Change.WasOn) }
+        default      { return $true }
+    }
 }
 
 # ------------------------------------------------------------
@@ -403,15 +963,16 @@ $Script:Has = @{
 
 # WMI query that never crashes: tries CIM, then old-style WMI, else returns nothing
 function Get-CimSafe {
-    param([string]$Class, [string]$Filter = '')
+    param([string]$Class, [string]$Filter = '', [string]$Namespace = 'root/cimv2')
     try {
-        if ($Filter) { return Get-CimInstance -ClassName $Class -Filter $Filter -ErrorAction Stop }
-        return Get-CimInstance -ClassName $Class -ErrorAction Stop
+        if ($Filter) { return Get-CimInstance -Namespace $Namespace -ClassName $Class -Filter $Filter -ErrorAction Stop }
+        return Get-CimInstance -Namespace $Namespace -ClassName $Class -ErrorAction Stop
     } catch {
         try {
             if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
-                if ($Filter) { return Get-WmiObject -Class $Class -Filter $Filter -ErrorAction Stop }
-                return Get-WmiObject -Class $Class -ErrorAction Stop
+                $ns = $Namespace -replace '/', '\'
+                if ($Filter) { return Get-WmiObject -Namespace $ns -Class $Class -Filter $Filter -ErrorAction Stop }
+                return Get-WmiObject -Namespace $ns -Class $Class -ErrorAction Stop
             }
         } catch {}
     }
@@ -539,8 +1100,110 @@ function Get-SystemProfile {
 
     $s.Appx = @(Get-InstalledAppx)
     $s.HasXbox = [bool]($s.Appx | Where-Object { $_.Name -like 'Microsoft.Xbox*' -or $_.Name -eq 'Microsoft.GamingApp' })
+    $s.Health = @()
 
     return $s
+}
+
+# ============================================================
+# HEALTH CHECKS (shown in the PC report)
+# Each result: Status = OK / WARN / INFO, Text = what to tell the user
+# ============================================================
+function Get-HealthChecks {
+    $results = New-Object System.Collections.Generic.List[object]
+    $add = { param($Status, $Text) $results.Add([pscustomobject]@{ Status = $Status; Text = $Text }) }
+
+    # ---- Disk health (SMART) ----
+    try {
+        $disksChecked = 0
+        if ($Script:Has.Storage) {
+            foreach ($pd in @(Get-PhysicalDisk -ErrorAction Stop)) {
+                $disksChecked++
+                $name = ([string]$pd.FriendlyName).Trim()
+                $health = [string]$pd.HealthStatus
+                $details = @()
+                $worn = $false; $hot = $false
+                try {
+                    $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop
+                    if ($null -ne $rc.Wear -and [int]$rc.Wear -gt 0) {
+                        $details += "$($rc.Wear)% worn"
+                        if ([int]$rc.Wear -ge 90) { $worn = $true }
+                    }
+                    if ($rc.Temperature -and [int]$rc.Temperature -gt 0) {
+                        $details += "$($rc.Temperature) C"
+                        if ([int]$rc.Temperature -ge 70) { $hot = $true }
+                    }
+                } catch {}
+                $detailText = if ($details.Count) { " ($($details -join ', '))" } else { '' }
+                if ($health -eq 'Healthy' -and -not $worn -and -not $hot) {
+                    & $add 'OK' "Disk '$name': healthy$detailText"
+                } elseif ($health -eq 'Healthy') {
+                    $why = if ($worn) { 'almost worn out - back up your files and plan a replacement' } else { 'running hot - check airflow' }
+                    & $add 'WARN' "Disk '$name': $why$detailText"
+                } else {
+                    & $add 'WARN' "Disk '$name': Windows reports it as '$health'$detailText - BACK UP YOUR FILES NOW, the drive may be failing"
+                }
+            }
+        }
+        if ($disksChecked -eq 0) {
+            # Fallback: classic SMART failure prediction
+            foreach ($d in @(Get-CimSafe 'MSStorageDriver_FailurePredictStatus' -Namespace 'root/wmi')) {
+                $disksChecked++
+                if ($d.PredictFailure) { & $add 'WARN' "A disk reports a SMART failure warning - BACK UP YOUR FILES NOW" }
+                else { & $add 'OK' 'Disk SMART status: no failure predicted' }
+            }
+        }
+        if ($disksChecked -eq 0) { & $add 'INFO' "Disk health: Windows doesn't report it on this PC" }
+    } catch { Write-Log "HEALTH disk check failed: $($_.Exception.Message)" }
+
+    # ---- GPU driver ----
+    try {
+        foreach ($g in @(Get-CimSafe 'Win32_VideoController')) {
+            $name = ([string]$g.Name).Trim()
+            if (-not $name -or $name -match 'Remote Display|Hyper-V|Parsec|Virtual Display|Meta Virtual|Citrix|VMware SVGA|VirtualBox') { continue }
+            if ($name -match 'Microsoft Basic (Display|Render)') {
+                & $add 'WARN' "Graphics: no proper driver installed (using 'Microsoft Basic Display Adapter') - install your NVIDIA/AMD/Intel driver"
+                continue
+            }
+            $date = $g.DriverDate
+            if ($date -is [string]) { try { $date = [Management.ManagementDateTimeConverter]::ToDateTime($date) } catch { $date = $null } }
+            if ($date -isnot [datetime]) { & $add 'INFO' "GPU '$name': driver $($g.DriverVersion)"; continue }
+            $months = [int][math]::Floor(((Get-Date) - $date).TotalDays / 30.4)
+            $where = if ($name -match 'NVIDIA') { 'the NVIDIA app or nvidia.com' }
+                     elseif ($name -match 'AMD|Radeon') { 'AMD Software: Adrenalin Edition or amd.com' }
+                     elseif ($name -match 'Intel') { 'the Intel Driver & Support Assistant (or your laptop maker)' }
+                     else { "the maker's website" }
+            $text = "GPU '$name': driver from $($date.ToString('yyyy-MM-dd')) ($months month(s) old)"
+            if ($months -ge 12)    { & $add 'WARN' "$text - update it from $where" }
+            elseif ($months -ge 6) { & $add 'INFO' "$text - a newer one is probably available from $where" }
+            else                   { & $add 'OK'   $text }
+        }
+    } catch { Write-Log "HEALTH gpu check failed: $($_.Exception.Message)" }
+
+    # ---- RAM speed (XMP / EXPO) ----
+    try {
+        $sticks = @(Get-CimSafe 'Win32_PhysicalMemory' | Where-Object { $_.Speed })
+        if ($sticks.Count) {
+            $rated   = [int](($sticks | Measure-Object -Property Speed -Minimum).Minimum)
+            $current = [int](($sticks | Where-Object { $_.ConfiguredClockSpeed } | Measure-Object -Property ConfiguredClockSpeed -Minimum).Minimum)
+            if ($current -gt 0 -and $current * 2 -eq $rated) { $current = $rated }   # some PCs report MHz instead of MT/s
+            $isDesktop = -not $Script:Sys.IsLaptop
+            if ($current -gt 0 -and $current -lt $rated) {
+                if ($isDesktop) { & $add 'WARN' "RAM runs at $current MT/s but is rated for $rated MT/s - turn on XMP (Intel) / EXPO (AMD) in your BIOS for free performance" }
+                else            { & $add 'INFO' "RAM runs at $current MT/s (rated $rated MT/s) - laptops usually can't change this" }
+            } elseif ($current -gt 0) {
+                # Windows can only see the standard (JEDEC) speed, so a kit sold as faster can still have XMP/EXPO off
+                $jedec = @(1600, 1866, 2133, 2400, 2666, 2933, 3200, 4800, 5200, 5600)
+                if ($isDesktop -and $jedec -contains $current) {
+                    & $add 'INFO' "RAM runs at $current MT/s (a standard speed). If your RAM kit is sold as faster (check its box/label), turn on XMP/EXPO in the BIOS"
+                } else {
+                    & $add 'OK' "RAM runs at $current MT/s"
+                }
+            }
+        }
+    } catch { Write-Log "HEALTH ram check failed: $($_.Exception.Message)" }
+
+    return $results
 }
 
 function Get-HiberInfo {
@@ -557,14 +1220,17 @@ function Show-Banner {
     Clear-Host
     Write-Host ""
     Pink  "  =================================================="
-    Pink  "   _                             "
-    Pink  "  | |    ___ _ __ _  ___ __   __ _ "
-    Pink  "  | |   / _ \ '__| |/ / '_ \ / _' |"
-    Pink  "  | |__|  __/ |  |   <| | | | (_| |"
-    Pink  "  |_____\___|_|  |_|\_\_| |_|\__,_|"
+    Pink  '   _'
+    Pink  '  | |      ___  _ __ __  __ _ __    __ _'
+    Pink  '  | |     / _ \| ''__|\ \/ /| ''_ \  / _` |'
+    Pink  '  | |___ |  __/| |    >  < | | | || (_| |'
+    Pink  '  |_____| \___||_|   /_/\_\|_| |_| \__,_|'
     Pink  ""
     Pink  "        O p t i m i z e r  v$($Script:Version)"
     Pink  "  =================================================="
+    if ($Script:Preview) {
+        Write-Host "   PREVIEW MODE - shows what would change, changes nothing" -ForegroundColor Cyan
+    }
     Write-Host ""
 }
 
@@ -581,6 +1247,20 @@ function Show-SystemReport {
     Write-Host ("   Disk     : {0} {1} - {2} GB free of {3} GB ({4}%)" -f $env:SystemDrive, $s.DiskType, $s.DiskFreeGB, $s.DiskSizeGB, $s.DiskFreePct)
     Write-Host ("   Uptime   : {0}" -f $s.UptimeText)
     if ($s.GameLaunchers.Count) { Write-Host ("   Gaming   : {0}" -f ($s.GameLaunchers -join ', ')) }
+
+    # Health checks
+    if (-not $s.Health -or @($s.Health).Count -eq 0) { $s.Health = @(Get-HealthChecks) }
+    if (@($s.Health).Count) {
+        Write-Host ""
+        Write-Host "   Health:" -ForegroundColor White
+        foreach ($h in $s.Health) {
+            $tag   = switch ($h.Status) { 'OK' { '[OK]' } 'WARN' { '[!!]' } default { '[i] ' } }
+            $color = switch ($h.Status) { 'OK' { 'Green' } 'WARN' { 'Yellow' } default { 'Gray' } }
+            Write-Host "    $tag " -ForegroundColor $color -NoNewline
+            Write-Host $h.Text
+            Write-Log "HEALTH $($h.Status): $($h.Text)"
+        }
+    }
 
     $on   = @($Script:LastScan | Where-Object { $_.Enabled })
     $safe = @($on | Where-Object { $_.Rec -eq 'Disable' })
@@ -617,6 +1297,7 @@ function Show-SystemReport {
 # RESTORE POINT
 # ============================================================
 function New-RestorePoint {
+    if ($Script:Preview) { Add-PreviewLine 'would create' 'a System Restore point'; return }
     Pink "`n  Creating a restore point (this can take a minute)..."
     Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' 'SystemRestorePointCreationFrequency' 0
     try {
@@ -772,7 +1453,9 @@ function Get-BloatServiceTargets {
 }
 
 function Remove-AppxSafe {
-    param([string]$Pattern)
+    param([string]$Pattern, [string]$Name = $Pattern)
+    if ($Script:Preview) { Add-PreviewLine 'would remove' "app: $Name"; return }
+    Save-JournalChange @{ Kind = 'Note'; Text = "Removed app '$Name' - reinstall it from the Microsoft Store if you want it back" }
     foreach ($p in @($Script:Sys.Appx | Where-Object { $_.Name -like $Pattern })) {
         try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop }
         catch {
@@ -810,6 +1493,10 @@ function Invoke-AppRemoval {
         Write-Host ("   {0,3}. {1}" -f $i, $a.Name) -NoNewline
         Write-Host $tag -ForegroundColor DarkYellow
     }
+    if ($Script:Preview) {
+        Add-PreviewLine 'would ask' "which of these $($found.Count) apps to remove: $(($found | ForEach-Object { $_.Name }) -join ', ')"
+        return
+    }
     Write-Host ""
     Write-Host "   [1] Remove the junk only (keeps the ones marked useful)"
     Write-Host "   [2] Ask me about each one"
@@ -830,7 +1517,7 @@ function Invoke-AppRemoval {
     if ($toRemove.Count -eq 0) { $Script:TweakCancelled = $true; return }
     foreach ($a in $toRemove) {
         Write-Host "     Removing $($a.Name)..." -ForegroundColor DarkGray
-        Remove-AppxSafe $a.Id
+        Remove-AppxSafe $a.Id $a.Name
     }
     $Script:Sys.Appx = @(Get-InstalledAppx)
     Info "Removed $($toRemove.Count) app(s). You can reinstall any of them from the Microsoft Store."
@@ -838,7 +1525,6 @@ function Invoke-AppRemoval {
 
 function Initialize-Tweaks {
     $s    = $Script:Sys
-    $adv  = $Script:AdvKey
     $hib  = Get-HiberInfo
     $bloatTargets = @(Get-BloatServiceTargets)
     $bloatLabels  = @($bloatTargets | ForEach-Object { $_.Label } | Select-Object -Unique)
@@ -870,8 +1556,8 @@ function Initialize-Tweaks {
                if (-not (Set-PowerScheme '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' 'High performance')) {
                    throw "High Performance isn't available on this PC (common on laptops with Modern Standby)."
                }
-               powercfg /change standby-timeout-ac 0 | Out-Null
-               powercfg /change hibernate-timeout-ac 0 | Out-Null
+               Set-PowerTimeoutAC 'STANDBYIDLE' 'Sleep after' 0
+               Set-PowerTimeoutAC 'HIBERNATEIDLE' 'Hibernate after' 0
            } }
 
         @{ Cat = 'Performance'; Title = 'Ultimate Performance power plan'; Show = (-not $s.IsLaptop)
@@ -881,13 +1567,13 @@ function Initialize-Tweaks {
                if (-not (Set-PowerScheme 'e9a42b02-d5df-448d-aa00-03f14749eb61' 'Ultimate Performance')) {
                    throw "Ultimate Performance isn't available on this edition of Windows."
                }
-               powercfg /change standby-timeout-ac 0 | Out-Null
+               Set-PowerTimeoutAC 'STANDBYIDLE' 'Sleep after' 0
            } }
 
         @{ Cat = 'Performance'; Title = 'Turn off hibernation'; Show = $hib.On; Rec = (-not $s.IsLaptop)
            Q = "Turn off hibernation? (frees about $($hib.GB) GB of disk space)"
            Note = "Deletes hiberfil.sys. Also turns off Fast Startup.$(if ($s.IsLaptop) { "`nYou're on a laptop: you won't be able to hibernate anymore." })"
-           Action = { powercfg /h off | Out-Null } }
+           Action = { Set-Hibernation $false } }
 
         @{ Cat = 'Performance'; Title = 'Turn off Fast Startup'; Show = $hib.On
            Q = 'Turn off Fast Startup?'
@@ -952,7 +1638,7 @@ function Initialize-Tweaks {
            Q = 'Prioritize games and audio over background tasks? (removes network throttling)'
            Action = {
                $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
-               reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v "NetworkThrottlingIndex" /t REG_DWORD /d 0xffffffff /f | Out-Null
+               Set-Reg $mm 'NetworkThrottlingIndex' 4294967295   # 0xFFFFFFFF = no throttling
                Set-Reg $mm 'SystemResponsiveness' 10
                Set-Reg "$mm\Tasks\Games" 'GPU Priority' 8
                Set-Reg "$mm\Tasks\Games" 'Priority' 6
@@ -1118,7 +1804,7 @@ function Initialize-Tweaks {
            Action = {
                Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds' 'EnableFeeds' 0
                Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
-               reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "TaskbarDa" /t REG_DWORD /d 0 /f 2>$null | Out-Null
+               Set-Reg $Script:AdvKey 'TaskbarDa' 0
            } }
 
         # ---------------- APPEARANCE ----------------
@@ -1154,7 +1840,7 @@ function Initialize-Tweaks {
            Action = {
                if ($Script:Sys.IsWin11) {
                    Set-Reg $Script:AdvKey 'TaskbarAl' 0
-                   reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "TaskbarMn" /t REG_DWORD /d 0 /f 2>$null | Out-Null
+                   Set-Reg $Script:AdvKey 'TaskbarMn' 0
                }
                Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 1
                Set-Reg $Script:AdvKey 'ShowTaskViewButton' 0
@@ -1163,7 +1849,7 @@ function Initialize-Tweaks {
         @{ Cat = 'Appearance & Explorer'; Title = 'Classic right-click menu'; Show = $s.IsWin11; Explorer = $true
            Q = 'Bring back the classic (full) right-click menu?'
            Note = "No more clicking 'Show more options' every time."
-           Action = { reg add "HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" /f /ve | Out-Null } }
+           Action = { Set-Reg 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32' '' '' 'String' } }
 
         @{ Cat = 'Appearance & Explorer'; Title = "'End task' on taskbar"; Show = ($s.Build -ge 22631); Rec = $true
            Q = "Add 'End task' to the taskbar right-click menu?"
@@ -1190,23 +1876,25 @@ function Initialize-Tweaks {
                }
            } }
 
-        @{ Cat = 'Apps & Bloatware'; Title = 'Remove OneDrive'; Show = $s.HasOneDrive; Caution = $true; Explorer = $true
+        @{ Cat = 'Apps & Bloatware'; Title = 'Remove OneDrive'; Show = $s.HasOneDrive; Caution = $true; Explorer = $true; NoRoundTrip = $true
            Q = 'Uninstall OneDrive and stop it coming back?'
            Note = "Make sure everything is synced first. Files that are 'online-only' won't be on this PC after.`nYour OneDrive folder and local files are not deleted."
            Action = {
-               taskkill /f /im "OneDrive.exe" 2>$null | Out-Null
-               $setup = "$env:SYSTEMROOT\SysWOW64\OneDriveSetup.exe"
-               if (-not (Test-Path $setup)) { $setup = "$env:SYSTEMROOT\System32\OneDriveSetup.exe" }
-               if (Test-Path $setup) {
-                   Start-Process $setup '/uninstall' -NoNewWindow -Wait
-               } else {
-                   $un = Get-ItemProperty -Path $Script:UninstallKeys -ErrorAction SilentlyContinue |
-                         Where-Object { $_.DisplayName -like 'Microsoft OneDrive*' -and $_.UninstallString } | Select-Object -First 1
-                   if ($un) { Start-Process 'cmd.exe' -ArgumentList "/c $($un.UninstallString)" -WindowStyle Hidden -Wait }
+               Invoke-Step 'Close and uninstall OneDrive (reinstall it from microsoft.com/onedrive if you want it back)' {
+                   Stop-Process -Name 'OneDrive' -Force -ErrorAction SilentlyContinue
+                   $setup = "$env:SYSTEMROOT\SysWOW64\OneDriveSetup.exe"
+                   if (-not (Test-Path $setup)) { $setup = "$env:SYSTEMROOT\System32\OneDriveSetup.exe" }
+                   if (Test-Path $setup) {
+                       Start-Process $setup '/uninstall' -NoNewWindow -Wait
+                   } else {
+                       $un = Get-ItemProperty -Path $Script:UninstallKeys -ErrorAction SilentlyContinue |
+                             Where-Object { $_.DisplayName -like 'Microsoft OneDrive*' -and $_.UninstallString } | Select-Object -First 1
+                       if ($un) { Start-Process 'cmd.exe' -ArgumentList "/c $($un.UninstallString)" -WindowStyle Hidden -Wait }
+                   }
                }
                Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1
                Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSync' 1
-               Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'OneDrive' -ErrorAction SilentlyContinue
+               Remove-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' 'OneDrive'
                foreach ($odt in @(Get-AllTasks | Where-Object { $_.TaskName -like 'OneDrive*' })) {
                    Disable-TaskSafe $odt.TaskPath $odt.TaskName
                }
@@ -1252,13 +1940,33 @@ function Get-TerminalExes {
 function Invoke-Tweak {
     param($T)
     $Script:TweakCancelled = $false
+
+    if ($Script:Preview) {
+        Pink "     Preview: $($T.Title)"
+        $Script:PreviewLog.Add("")
+        $Script:PreviewLog.Add("== $($T.Title) ==")
+        try {
+            & $T.Action | Out-Null
+            $Script:Previewed.Add($T.Title)
+        } catch {
+            Warn "$($T.Title): $($_.Exception.Message)"
+            $Script:Failed.Add($T.Title)
+        }
+        return
+    }
+
     Pink "     Applying: $($T.Title)..."
+    $errorsBefore = $Script:ChangeErrors
+    Start-TweakRecord $T.Title ([bool]$T.Explorer)
     try {
         & $T.Action | Out-Null
         if ($Script:TweakCancelled) {
             Skip $T.Title
             $Script:Skipped.Add($T.Title)
             return
+        }
+        if ($Script:ChangeErrors -gt $errorsBefore) {
+            Warn "$($T.Title): $($Script:ChangeErrors - $errorsBefore) setting(s) couldn't be changed (Windows blocked them). The rest were applied."
         }
         Done $T.Title
         $Script:Applied.Add($T.Title)
@@ -1267,7 +1975,43 @@ function Invoke-Tweak {
     } catch {
         Warn "$($T.Title) failed: $($_.Exception.Message)"
         $Script:Failed.Add($T.Title)
+    } finally {
+        $Script:CurrentRecord = $null
     }
+}
+
+# Shows every change every tweak would make, without changing anything
+function Invoke-PreviewAll {
+    param($Tweaks)
+    $wasPreview = $Script:Preview
+    $Script:Preview = $true
+    try {
+        foreach ($cat in $Script:Categories) {
+            $items = @($Tweaks | Where-Object { $_.Cat -eq $cat })
+            if ($items.Count -eq 0) { continue }
+            Section "$cat (preview)"
+            foreach ($t in $items) { Invoke-Tweak $t }
+        }
+        Save-PreviewReport
+    } finally {
+        $Script:Preview = $wasPreview
+    }
+}
+
+function Save-PreviewReport {
+    if ($Script:PreviewLog.Count -eq 0) { return }
+    $file = Join-Path $Script:DataDir ("preview_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $header = @(
+        "Lerxna Optimizer v$($Script:Version) - preview report ($(Get-Date -Format 'yyyy-MM-dd HH:mm'))"
+        "Nothing was changed. This is what each option WOULD do on this PC."
+        ""
+    )
+    try {
+        Set-Content -LiteralPath $file -Value (@($header) + @($Script:PreviewLog)) -Encoding UTF8 -ErrorAction Stop
+        Write-Host ""
+        Done "Preview saved to: $file"
+        $Script:PreviewLog.Clear()
+    } catch {}
 }
 
 function Invoke-TweakWizard {
@@ -1280,14 +2024,18 @@ function Invoke-TweakWizard {
     Write-Host "   [1] Ask me about every tweak (Y/N for each)"
     Write-Host "   [2] Recommended - auto-apply the safe ones, ask me about the rest"
     Write-Host "   [3] Express - apply only the recommended ones, don't ask anything else"
+    Write-Host "   [4] Preview - show me exactly what every tweak would change (changes nothing)"
     Write-Host "   [0] Back"
-    $mode = Read-Choice "Choose [0-3]:" @('0', '1', '2', '3')
+    if ($Script:Preview) { Write-Host "   (Preview mode is ON - whatever you pick, nothing will be changed)" -ForegroundColor Cyan }
+    $mode = Read-Choice "Choose [0-4]:" @('0', '1', '2', '3', '4')
     if ($mode -eq '0') { return }
+    if ($mode -eq '4') { Invoke-PreviewAll $visible; return }
 
     if ($mode -ne '1') {
         $autoList = @($visible | Where-Object { $_.Rec -and -not $_.Interactive })
         Write-Host ""
-        Write-Host "   These $($autoList.Count) recommended tweaks will be applied automatically:" -ForegroundColor White
+        $verb = if ($Script:Preview) { 'previewed' } else { 'applied automatically' }
+        Write-Host "   These $($autoList.Count) recommended tweaks will be $($verb):" -ForegroundColor White
         foreach ($t in $autoList) { Write-Host "     + $($t.Title)" -ForegroundColor Green }
         if (-not (Ask "Go ahead?")) { return }
     }
@@ -1328,7 +2076,8 @@ function Invoke-TweakWizard {
 
     if ($Script:NeedsExplorerRestart) { Restart-Explorer }
     Write-Host ""
-    Done "System tweaks finished."
+    if ($Script:Preview) { Save-PreviewReport; Done "Preview finished - nothing was changed." }
+    else { Done "System tweaks finished. Any of them can be undone from the Undo menu." }
 }
 
 # ============================================================
@@ -1649,8 +2398,22 @@ function Remove-Backup {
 }
 
 # ---------------- turn items off / on ----------------
+function Get-StartupMethod {
+    param($Item, [bool]$On)
+    switch ($Item.Type) {
+        'Service' { if ($On) { return 'startup type back to Automatic' } else { return 'startup type Automatic -> Manual' } }
+        'Task'    { if ($On) { return 'scheduled task enabled' } else { return 'scheduled task disabled' } }
+        'Store'   { return 'Store app startup setting' }
+        default   { if ($On) { return 'marked Enabled, like Task Manager' } else { return 'marked Disabled, like Task Manager - nothing deleted' } }
+    }
+}
+
 function Disable-StartupItem {
     param($Item)
+    if ($Script:Preview) {
+        Add-PreviewLine 'would turn off' ("{0} ({1}: {2})" -f $Item.Name, $Item.TypeLabel, (Get-StartupMethod $Item $false))
+        return $false
+    }
     try {
         switch ($Item.Type) {
             'Run'     { Set-ApprovedState $Item.ApprovedKey $Item.ValueName $false }
@@ -1671,6 +2434,10 @@ function Disable-StartupItem {
 
 function Enable-StartupItem {
     param($Item)
+    if ($Script:Preview) {
+        Add-PreviewLine 'would turn on' ("{0} ({1}: {2})" -f $Item.Name, $Item.Type, (Get-StartupMethod $Item $true))
+        return $false
+    }
     try {
         switch ($Item.Type) {
             'Run'     { Set-ApprovedState $Item.ApprovedKey $Item.ValueName $true }
@@ -1694,6 +2461,7 @@ function Enable-StartupItem {
 
 function Stop-ItemProcesses {
     param($Item)
+    if ($Script:Preview) { Add-PreviewLine 'would close' $Item.Name; return }
     if ($Item.Type -eq 'Service') {
         Stop-Service -Name $Item.ServiceName -Force -ErrorAction SilentlyContinue
         return
@@ -1857,6 +2625,7 @@ function Show-HeavyApps {
     $chosen = @($sel | ForEach-Object { $groups[$_ - 1] })
     if (-not (Ask "Close $(($chosen | ForEach-Object { $_.Name }) -join ', ')?" 'CAUTION' 'Unsaved work in those apps will be lost.')) { return }
     foreach ($g in $chosen) {
+        if ($Script:Preview) { Add-PreviewLine 'would close' "$($g.Name) (~$($g.MemMB) MB)"; continue }
         Stop-Process -Name $g.Name -Force -ErrorAction SilentlyContinue
         Done "Closed $($g.Name) (freed ~$($g.MemMB) MB)"
     }
@@ -1935,6 +2704,18 @@ function Invoke-Cleanup {
                            Paths = @("$env:LOCALAPPDATA\D3DSCache", "$env:LOCALAPPDATA\NVIDIA\DXCache", "$env:LOCALAPPDATA\NVIDIA\GLCache",
                                      "$env:LOCALAPPDATA\AMD\DxCache", "$env:LOCALAPPDATA\AMD\DxcCache", "$env:LOCALAPPDATA\AMD\GLCache") }
     )
+    if ($Script:Preview) {
+        $Script:PreviewLog.Add("")
+        $Script:PreviewLog.Add("== Junk file cleanup ==")
+        foreach ($t in $targets) {
+            $size = Get-FolderSize $t.Paths
+            if ($size -ge 1MB) { Add-PreviewLine 'would offer to delete' "$($t.Name) - $(Format-Size $size) ($($t.Paths -join '; '))" }
+        }
+        Add-PreviewLine 'would offer' 'empty the Recycle Bin, clear the Delivery Optimization cache, flush DNS'
+        Add-PreviewLine 'would offer' 'DISM component cleanup and SFC system file repair'
+        Save-PreviewReport
+        return
+    }
     $freed = 0
     foreach ($t in $targets) {
         $size = Get-FolderSize $t.Paths
@@ -1997,19 +2778,55 @@ function Invoke-Cleanup {
 # ============================================================
 # UNDO MENU
 # ============================================================
+function Invoke-UndoTweaks {
+    param($Records)
+    $list = @($Records)
+    [array]::Reverse($list)    # newest first
+    $fails = 0
+    foreach ($r in $list) {
+        if ($Script:Preview) { Write-Host "     $($r.Title)" -ForegroundColor White }
+        else { Pink "     Undoing: $($r.Title)..." }
+        $f = Undo-TweakRecord $r
+        $fails += $f
+        if (-not $Script:Preview -and $f -eq 0) { Done "$($r.Title) undone." }
+    }
+    if ($Script:NeedsExplorerRestart) { Restart-Explorer }
+    if (-not $Script:Preview) {
+        if ($fails) { Warn "$fails change(s) couldn't be undone - see the log. System Restore can still roll everything back." }
+        else { Info "Restart your PC so every setting goes back fully." }
+    }
+}
+
 function Invoke-UndoMenu {
     while ($true) {
         Section "Undo / Restore"
-        $backup = @(Get-Backup)
+        $journal = @(Get-TweakJournal)
+        $backup  = @(Get-Backup)
         $ifeo = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\TextInputHost.exe'
-        $touchBlocked = [bool](Get-RegValue $ifeo 'Debugger')
         $layersCU = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
         $layersLM = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
+        # Older versions changed these without saving the old value - offer a manual fix
+        $touchBlocked = [bool](Get-RegValue $ifeo 'Debugger') -and -not ($journal | Where-Object { $_.Title -like 'Block touch keyboard*' })
         $termAdmin = $false
         foreach ($exe in (Get-TerminalExes)) {
             if ((Get-RegValue $layersCU $exe) -or (Get-RegValue $layersLM $exe)) { $termAdmin = $true }
         }
+        if ($journal | Where-Object { $_.Title -eq 'Terminals always as admin' }) { $termAdmin = $false }
 
+        if ($journal.Count) {
+            Write-Host "   Tweaks applied by Lerxna Optimizer:" -ForegroundColor White
+            $i = 0
+            foreach ($r in $journal) {
+                $i++
+                $changes = @($r.Changes | Where-Object { $_ })
+                $partial = if (@($changes | Where-Object { $_.Kind -eq 'Note' }).Count) { '  (part of it is permanent)' } else { '' }
+                Write-Host ("   {0,3}. {1}  - {2} change(s), {3}" -f $i, $r.Title, $changes.Count, $r.Date) -NoNewline
+                Write-Host $partial -ForegroundColor DarkYellow
+            }
+        } else {
+            Info "No tweaks to undo (tweaks applied with v2.0 or older can only be rolled back with System Restore)."
+        }
+        Write-Host ""
         if ($backup.Count) {
             Write-Host "   Startup items turned off by Lerxna Optimizer:" -ForegroundColor White
             $i = 0
@@ -2018,49 +2835,74 @@ function Invoke-UndoMenu {
             Info "No startup items have been turned off by Lerxna Optimizer."
         }
 
-        $valid = @('0', '5')
+        $valid = @('0', 'R')
         Write-Host ""
+        if ($journal.Count) {
+            Write-Host "   [T] Undo ALL tweaks"
+            Write-Host "   [P] Pick which tweaks to undo"
+            Write-Host "   [V] Show exactly what undoing would change (changes nothing)"
+            $valid += 'T', 'P', 'V'
+        }
         if ($backup.Count) {
-            Write-Host "   [1] Turn ALL of them back on"
-            Write-Host "   [2] Pick which ones to turn back on"
-            $valid += '1', '2'
+            Write-Host "   [S] Turn ALL startup items back on"
+            Write-Host "   [O] Pick which startup items to turn back on"
+            $valid += 'S', 'O'
         }
         if ($touchBlocked) {
-            Write-Host "   [3] Fix touch keyboard / emoji panel / clipboard history (remove TextInputHost block)"
-            $valid += '3'
+            Write-Host "   [K] Fix touch keyboard / emoji panel / clipboard history (remove TextInputHost block)"
+            $valid += 'K'
         }
         if ($termAdmin) {
-            Write-Host "   [4] Stop PowerShell / CMD / Terminal always running as admin"
-            $valid += '4'
+            Write-Host "   [A] Stop PowerShell / CMD / Terminal always running as admin"
+            $valid += 'A'
         }
-        Write-Host "   [5] Open System Restore (roll everything back to a restore point)"
+        Write-Host "   [R] Open System Restore (roll everything back to a restore point)"
         Write-Host "   [0] Back"
         $c = Read-Choice "Choose:" $valid
 
         switch ($c) {
             '0' { return }
-            '1' { foreach ($b in $backup) { if (Enable-StartupItem $b) { Done "$($b.Name) turned back on." } } }
-            '2' {
-                $txt = Read-Host "  Numbers to turn back on (e.g. 1,3)"
+            'T' {
+                if (Ask "Undo all $($journal.Count) tweak(s)?") { Invoke-UndoTweaks $journal }
+            }
+            'P' {
+                $txt = Read-Host "  Tweak numbers to undo (e.g. 1,3)"
+                $sel = @(Parse-Selection $txt $journal.Count)
+                if ($sel.Count) { Invoke-UndoTweaks @($sel | Sort-Object | ForEach-Object { $journal[$_ - 1] }) }
+            }
+            'V' {
+                $wasPreview = $Script:Preview
+                $Script:Preview = $true
+                try {
+                    Write-Host ""
+                    Write-Host "   Undoing everything would:" -ForegroundColor White
+                    Invoke-UndoTweaks $journal
+                    $Script:PreviewLog.Clear()
+                } finally { $Script:Preview = $wasPreview }
+            }
+            'S' { foreach ($b in $backup) { if (Enable-StartupItem $b) { Done "$($b.Name) turned back on." } } }
+            'O' {
+                $txt = Read-Host "  Startup item numbers to turn back on (e.g. 1,3)"
                 foreach ($n in @(Parse-Selection $txt $backup.Count)) {
                     $b = $backup[$n - 1]
                     if (Enable-StartupItem $b) { Done "$($b.Name) turned back on." }
                 }
             }
-            '3' {
-                Remove-Item -LiteralPath $ifeo -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Log "UNDO TextInputHost block"
-                Done "Touch keyboard, emoji panel and clipboard history will work again (sign out or restart)."
+            'K' {
+                Remove-Reg $ifeo 'Debugger'
+                if (-not $Script:Preview) { Done "Touch keyboard, emoji panel and clipboard history will work again (sign out or restart)." }
             }
-            '4' {
+            'A' {
                 foreach ($exe in (Get-TerminalExes)) {
-                    Remove-ItemProperty -LiteralPath $layersCU -Name $exe -ErrorAction SilentlyContinue
-                    Remove-ItemProperty -LiteralPath $layersLM -Name $exe -ErrorAction SilentlyContinue
+                    Remove-Reg $layersCU $exe
+                    Remove-Reg $layersLM $exe
                 }
-                Write-Log "UNDO terminals as admin"
-                Done "Terminals will open normally again."
+                if (-not $Script:Preview) { Done "Terminals will open normally again." }
             }
-            '5' { Start-Process 'rstrui.exe' -ErrorAction SilentlyContinue; Info "System Restore opened in a new window." }
+            'R' {
+                if ($Script:Preview) { Add-PreviewLine 'would open' 'System Restore' }
+                else { Start-Process 'rstrui.exe' -ErrorAction SilentlyContinue; Info "System Restore opened in a new window." }
+            }
         }
     }
 }
@@ -2071,6 +2913,13 @@ function Invoke-UndoMenu {
 function Complete-Run {
     if ($Script:NeedsExplorerRestart) { Restart-Explorer }
     Section "Summary"
+    if ($Script:Preview) {
+        Write-Host ("   PREVIEW MODE - nothing was changed. Previewed {0} option(s)." -f $Script:Previewed.Count) -ForegroundColor Cyan
+        Save-PreviewReport
+        Info "Turn preview off in the main menu (option 8) when you're ready to apply changes."
+        $Script:SummaryShownAt = $Script:Applied.Count + $Script:StartupChanges
+        return
+    }
     Write-Host ("   Applied              : {0}" -f $Script:Applied.Count) -ForegroundColor Green
     foreach ($a in $Script:Applied) { Write-Host "     + $a" -ForegroundColor Green }
     Write-Host ("   Skipped              : {0}" -f $Script:Skipped.Count) -ForegroundColor DarkGray
@@ -2081,7 +2930,7 @@ function Complete-Run {
     Write-Host ("   Startup changes      : {0}" -f $Script:StartupChanges) -ForegroundColor Cyan
     Write-Host ""
     Info "Log file    : $Script:LogFile"
-    Info "Undo startup changes any time: run Lerxna Optimizer again > Undo / restore"
+    Info "Changed your mind? Run Lerxna Optimizer again > Undo / restore - every tweak can be undone on its own."
     $Script:SummaryShownAt = $Script:Applied.Count + $Script:StartupChanges
 
     if ($Script:Applied.Count -gt 0 -or $Script:NeedsReboot) {
@@ -2091,6 +2940,124 @@ function Complete-Run {
             Restart-Computer -Force
         }
     }
+}
+
+# ============================================================
+# SELF-TEST (run by GitHub Actions on a real Windows machine)
+#   -SelfTest              : scan + preview every tweak, change nothing
+#   -SelfTest -RoundTrip   : also APPLY every tweak, UNDO it, and check
+#                            that every setting is back to how it was
+# Exit code 0 = passed, 1 = failed
+# ============================================================
+function Write-TestResult {
+    param([bool]$Ok, [string]$Text)
+    if ($Ok) { Write-Host "  [PASS] $Text" -ForegroundColor Green }
+    else {
+        Write-Host "  [FAIL] $Text" -ForegroundColor Red
+        if ($env:GITHUB_ACTIONS) { Write-Host "::error::$Text" }
+    }
+}
+
+function Invoke-SelfTest {
+    $failures = 0
+    $step = {
+        param([string]$Name, [scriptblock]$Block)
+        try { & $Block | Out-Null; Write-TestResult $true $Name; return 0 }
+        catch {
+            Write-TestResult $false ("{0}: {1} (line {2})" -f $Name, $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber)
+            return 1
+        }
+    }
+    Write-Host "== Lerxna Optimizer v$($Script:Version) self-test on $([Environment]::OSVersion.VersionString), PowerShell $($PSVersionTable.PSVersion) ==" -ForegroundColor White
+
+    $failures += & $step 'PC scan'           { $Script:Sys = Get-SystemProfile; if (-not $Script:Sys.Build) { throw 'no Windows build detected' } }
+    $failures += & $step 'Startup scan'      { $Script:LastScan = @(Get-StartupItems); Write-Host "         found $($Script:LastScan.Count) startup item(s)" }
+    $failures += & $step 'PC report + health'{ Show-SystemReport }
+    $failures += & $step 'Startup list'      { if ($Script:LastScan.Count) { Show-StartupList $Script:LastScan } }
+    $failures += & $step 'Build tweak list'  { Initialize-Tweaks; if (@($Script:Tweaks).Count -lt 30) { throw "only $(@($Script:Tweaks).Count) tweaks" } }
+
+    $visible = @($Script:Tweaks | Where-Object { $null -eq $_.Show -or $_.Show })
+    Write-Host "         $($visible.Count) of $(@($Script:Tweaks).Count) tweaks apply to this machine"
+
+    # 1) Preview every tweak - must not throw and must not change anything
+    $journalBefore = Test-Path -LiteralPath $Script:JournalFile
+    $Script:Preview = $true
+    foreach ($t in $visible) {
+        $failures += & $step "Preview: $($t.Title)" { & $t.Action | Out-Null }
+    }
+    $failures += & $step 'Preview: junk cleanup' { Invoke-Cleanup }
+    $Script:Preview = $false
+    $failures += & $step 'Preview changed nothing' {
+        if ((Test-Path -LiteralPath $Script:JournalFile) -ne $journalBefore) { throw 'the undo journal was written during preview' }
+    }
+
+    if ($RoundTrip) {
+        Write-Host ""
+        Write-Host "== Round trip: apply every tweak, undo it, verify ==" -ForegroundColor White
+        # Start with an empty journal so only this test's changes are in it
+        if (Test-Path -LiteralPath $Script:JournalFile) { Move-Item -LiteralPath $Script:JournalFile -Destination "$($Script:JournalFile).before-selftest" -Force }
+
+        foreach ($t in @($visible | Where-Object { -not $_.Interactive -and -not $_.NoRoundTrip })) {
+            Invoke-Tweak $t
+        }
+        $journal = @(Get-TweakJournal)
+        $changeCount = (@($journal | ForEach-Object { @($_.Changes | Where-Object { $_ }) }) | Measure-Object).Count
+        Write-Host "         $($journal.Count) tweaks recorded $changeCount change(s)"
+        $failures += & $step 'Tweaks recorded changes' { if ($changeCount -lt 20) { throw "only $changeCount changes were recorded" } }
+
+        # Undo everything, newest first
+        $undoFails = 0
+        $list = @($journal); [array]::Reverse($list)
+        foreach ($r in $list) { $undoFails += Undo-TweakRecord $r }
+        $failures += & $step 'Undo ran without errors' { if ($undoFails) { throw "$undoFails change(s) failed to undo" } }
+        $failures += & $step 'Undo journal emptied' { if (@(Get-TweakJournal).Count) { throw 'journal still has records' } }
+
+        # Every setting must be back to its ORIGINAL value. When two tweaks touched
+        # the same setting (e.g. High Performance then Ultimate Performance), only
+        # the first change holds the original, so check that one.
+        $bad = 0
+        $seen = @{}
+        foreach ($r in $journal) {
+            foreach ($c in @($r.Changes | Where-Object { $_ })) {
+                if ($seen.ContainsKey($c.Id)) { continue }
+                $seen[$c.Id] = $true
+                if (-not (Test-ChangeRestored $c)) {
+                    $bad++
+                    Write-TestResult $false "Not restored after undo [$($r.Title)]: $(Get-ChangeDescription $c)"
+                }
+            }
+        }
+        if ($bad -eq 0) { Write-TestResult $true "All $changeCount change(s) are back to their original values" }
+        $failures += $bad
+
+        # Startup manager round trip on a harmless test entry
+        $failures += & $step 'Startup item turn off / on' {
+            $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+            $approved = "$($Script:ApprovedHKCU)\Run"
+            Write-RegData $run 'LerxnaSelfTest' "`"$env:windir\System32\notepad.exe`"" 'String'
+            try {
+                $item = @(Get-StartupItems | Where-Object { $_.Type -eq 'Run' -and $_.ValueName -eq 'LerxnaSelfTest' }) | Select-Object -First 1
+                if (-not $item) { throw 'test entry not found by the scanner' }
+                if (-not $item.Enabled) { throw 'test entry should start enabled' }
+                if (-not (Disable-StartupItem $item)) { throw 'could not turn it off' }
+                if (Get-ApprovedEnabled $approved 'LerxnaSelfTest') { throw 'still enabled after turning off' }
+                if (-not (Enable-StartupItem $item)) { throw 'could not turn it back on' }
+                if (-not (Get-ApprovedEnabled $approved 'LerxnaSelfTest')) { throw 'still disabled after turning on' }
+            } finally {
+                Remove-RegData $run 'LerxnaSelfTest'
+                Remove-RegData $approved 'LerxnaSelfTest'
+            }
+        }
+
+        if (Test-Path -LiteralPath "$($Script:JournalFile).before-selftest") {
+            Move-Item -LiteralPath "$($Script:JournalFile).before-selftest" -Destination $Script:JournalFile -Force
+        }
+    }
+
+    Write-Host ""
+    if ($failures -eq 0) { Write-Host "SELF-TEST PASSED" -ForegroundColor Green; return 0 }
+    Write-Host "SELF-TEST FAILED ($failures problem(s)) - log: $Script:LogFile" -ForegroundColor Red
+    return 1
 }
 
 # ============================================================
@@ -2109,8 +3076,14 @@ function Invoke-Safely {
     }
 }
 
+if ($SelfTest) {
+    Write-Log "Lerxna Optimizer v$($Script:Version) self-test started"
+    $code = @(Invoke-SelfTest)[-1]
+    exit ([int]$code)
+}
+
 Show-Banner
-Write-Log "Lerxna Optimizer v$($Script:Version) started"
+Write-Log "Lerxna Optimizer v$($Script:Version) started$(if ($Script:Preview) { ' (preview mode)' })"
 Invoke-Safely -Name 'PC scan' -Block {
     $Script:Sys = Get-SystemProfile
     Write-Host "  Scanning startup apps..." -ForegroundColor Gray
@@ -2122,9 +3095,14 @@ if (-not $Script:Sys) {
 }
 
 Write-Host ""
-Pink "  You'll be asked before every change. Press Y to apply, N to skip."
-if (Ask "Create a System Restore point before making changes?" 'REC' 'Lets you roll back everything if you don''t like a change.') {
-    Invoke-Safely -Name 'Restore point' -Block { New-RestorePoint }
+if ($Script:Preview) {
+    Write-Host "  PREVIEW MODE: go through anything you like - nothing will be changed." -ForegroundColor Cyan
+} else {
+    Pink "  You'll be asked before every change. Press Y to apply, N to skip."
+    Pink "  Not sure? Pick option 8 (Preview mode) to see exactly what would change first."
+    if (Ask "Create a System Restore point before making changes?" 'REC' 'Lets you roll back everything if you don''t like a change.') {
+        Invoke-Safely -Name 'Restore point' -Block { New-RestorePoint }
+    }
 }
 
 $running = $true
@@ -2137,8 +3115,10 @@ while ($running) {
     Write-Host "   [5] Undo / restore"
     Write-Host "   [6] Create a restore point"
     Write-Host "   [7] Show my PC scan again"
+    if ($Script:Preview) { Write-Host "   [8] Preview mode: ON  (nothing is being changed - pick 8 to turn it off)" -ForegroundColor Cyan }
+    else                 { Write-Host "   [8] Preview mode: OFF (turn on to see what would change without changing anything)" }
     Write-Host "   [0] Finish & exit"
-    $choice = Read-Choice "Choose [0-7]:" @('0', '1', '2', '3', '4', '5', '6', '7')
+    $choice = Read-Choice "Choose [0-8]:" @('0', '1', '2', '3', '4', '5', '6', '7', '8')
 
     switch ($choice) {
         '1' {
@@ -2158,6 +3138,12 @@ while ($running) {
                 $Script:LastScan = @(Get-StartupItems)
                 Show-SystemReport
             }
+        }
+        '8' {
+            if ($Script:Preview) { Save-PreviewReport }
+            $Script:Preview = -not $Script:Preview
+            if ($Script:Preview) { Done "Preview mode ON - everything will show what it WOULD change, and change nothing." }
+            else { Done "Preview mode OFF - changes will be applied again (you'll still be asked first)." }
         }
         '0' { $running = $false }
     }

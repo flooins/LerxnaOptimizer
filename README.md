@@ -3,10 +3,14 @@ optimize ur pc
 
 A Windows 10 / 11 optimizer that **asks you Y/N before every change** and only asks about things that actually apply to your PC.
 
+[![Windows tests](../../actions/workflows/test.yml/badge.svg)](../../actions/workflows/test.yml)
+
 ## How to run
 
-1. Download **both** `Run-LerxnaOptimizer.bat` and `LerxnaOptimizer.ps1` into the same folder (if you downloaded a .zip, extract it first)
+1. Download the latest **`LerxnaOptimizer-vX.Y.zip`** from [Releases](../../releases) and extract it (right-click > Extract All)
 2. Double-click **`Run-LerxnaOptimizer.bat`** and click **Yes** when Windows asks for Administrator
+
+Nervous? Double-click **`Preview-LerxnaOptimizer.bat`** instead. It goes through everything the same way, but only **shows** every registry value, service and task it would change (with the current value next to it) and changes nothing. A copy of the preview is saved as a text file.
 
 Other ways that also work:
 - Right-click `LerxnaOptimizer.ps1` > **Run with PowerShell**
@@ -14,6 +18,10 @@ Other ways that also work:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\LerxnaOptimizer.ps1
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\LerxnaOptimizer.ps1 -Preview
 ```
 
 ## Works on
@@ -72,7 +80,25 @@ Three modes: **ask about everything**, **recommended** (auto-applies the safe on
 ### 4. Junk cleanup & repair
 Temp files, Windows Update cache, crash dumps, GPU shader caches, Recycle Bin, Delivery Optimization cache, DNS flush, DISM component cleanup, SFC/DISM repair. Shows how much space each one frees before asking.
 
-### 5. Safety
+### 5. Health checks
+The PC report also checks:
+- **Disk health**: SMART status, SSD wear and temperature for every drive
+- **GPU driver age**: warns if it's over a year old, or if no real driver is installed
+- **RAM speed**: warns if your RAM runs slower than it's rated for (XMP / EXPO turned off in the BIOS)
+
+### 6. Safety
+- **Preview mode** (`Preview-LerxnaOptimizer.bat`, `-Preview`, or option 8 in the menu): see every change before it happens
+- **Every tweak can be undone on its own**. Before changing anything, the old value of every registry setting, service, scheduled task and power setting is saved. The Undo menu lists each tweak you applied, so you can undo all of them, pick some, or preview what undoing would do. The only things that can't be undone automatically (uninstalled apps, OneDrive) are labelled clearly.
 - Offers to create a **System Restore point** before anything changes
-- **Undo menu**: turn startup items back on, fix the touch keyboard block, undo terminals-as-admin, open System Restore
 - Everything is logged to `C:\ProgramData\LerxnaOptimizer\`
+
+## Testing
+Every push runs on a real Windows machine (GitHub Actions, `windows-latest`):
+1. Syntax check in Windows PowerShell 5.1 and PowerShell 7, plus PSScriptAnalyzer
+2. A self-test that scans the PC and previews every tweak (`-SelfTest`)
+3. A round trip that **applies every tweak, undoes it, and checks that every single setting is back to its original value** (`-SelfTest -RoundTrip`)
+
+## Releases
+Pushing a version tag such as `v2.1` builds the zip and publishes it on the Releases page automatically.
+
+**Code signing (optional):** some antivirus programs are suspicious of unsigned "optimizer" scripts. To sign releases, get a code signing certificate (for example an OV certificate from a certificate authority, or Microsoft's Azure Trusted Signing), export it as a .pfx, and add two repository secrets: `SIGNING_CERT_BASE64` (the .pfx encoded as base64) and `SIGNING_CERT_PASSWORD`. The release workflow then signs `LerxnaOptimizer.ps1` automatically. Without them, releases are simply unsigned.

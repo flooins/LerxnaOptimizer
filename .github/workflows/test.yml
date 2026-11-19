@@ -1,0 +1,91 @@
+name: Windows tests
+
+# Runs on a real Windows machine (GitHub's free windows-latest runner)
+# every time code is pushed or a pull request is opened.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Syntax check + PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem -Recurse -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { "::error file=$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+          'No syntax errors in Windows PowerShell 5.1'
+
+      - name: Syntax check (PowerShell 7)
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem -Recurse -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { "::error file=$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+          'No syntax errors in PowerShell 7'
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          }
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          foreach ($r in $results) {
+            $level = if ($r.Severity -in 'Error', 'ParseError') { 'error' } else { 'warning' }
+            "::$level file=$($r.ScriptName),line=$($r.Line)::[$($r.RuleName)] $($r.Message)"
+          }
+          $results | Sort-Object Severity, Line | Format-Table Severity, Line, RuleName, Message -AutoSize -Wrap | Out-String -Width 220
+          $errors = @($results | Where-Object { $_.Severity -in 'Error', 'ParseError' })
+          "$($results.Count) finding(s), $($errors.Count) error(s)"
+          if ($errors.Count) { exit 1 }
+
+  selftest:
+    name: Run on Windows (preview + apply/undo round trip)
+    needs: lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test, preview only (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          .\LerxnaOptimizer.ps1 -SelfTest
+          exit $LASTEXITCODE
+
+      - name: Self-test, preview only (PowerShell 7)
+        shell: pwsh
+        run: |
+          ./LerxnaOptimizer.ps1 -SelfTest
+          exit $LASTEXITCODE
+
+      - name: Apply every tweak, undo, verify everything is restored
+        shell: powershell
+        run: |
+          .\LerxnaOptimizer.ps1 -SelfTest -RoundTrip
+          exit $LASTEXITCODE
+
+      - name: Upload logs and preview reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lerxna-logs
+          path: C:\ProgramData\LerxnaOptimizer\
+          if-no-files-found: ignore

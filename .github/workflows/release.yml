@@ -1,0 +1,67 @@
+name: Release
+
+# Push a version tag (for example v2.1) to build a single zip with
+# everything in it and publish it as a GitHub Release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      # Code signing is optional: it only runs once the two secrets below are added
+      # (repo Settings > Secrets and variables > Actions).
+      HAS_CERT: ${{ secrets.SIGNING_CERT_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test before releasing
+        shell: powershell
+        run: |
+          .\LerxnaOptimizer.ps1 -SelfTest
+          exit $LASTEXITCODE
+
+      - name: Sign the script (only if a code signing certificate is configured)
+        if: env.HAS_CERT == 'true'
+        shell: powershell
+        env:
+          SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT_BASE64))
+          try {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx, $env:SIGNING_CERT_PASSWORD)
+            $sig = Set-AuthenticodeSignature -FilePath .\LerxnaOptimizer.ps1 -Certificate $cert -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
+            if ($sig.Status -ne 'Valid') { throw "Signing failed: $($sig.StatusMessage)" }
+            'Signed LerxnaOptimizer.ps1'
+          } finally {
+            Remove-Item $pfx -Force
+          }
+
+      - name: Build the zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $zip = "dist/LerxnaOptimizer-$env:TAG.zip"
+          Compress-Archive -Path LerxnaOptimizer.ps1, Run-LerxnaOptimizer.bat, Preview-LerxnaOptimizer.bat, README.md -DestinationPath $zip
+          Get-Item $zip | Format-List Name, Length
+
+      - name: Publish the GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          ## Download
+          1. Download **LerxnaOptimizer-$env:TAG.zip** below
+          2. Right-click it > **Extract All** (don't run it from inside the zip)
+          3. Double-click **Run-LerxnaOptimizer.bat** (or **Preview-LerxnaOptimizer.bat** to see what it would change without changing anything)
+          "@
+          gh release create "$env:TAG" "dist/LerxnaOptimizer-$env:TAG.zip" --title "Lerxna Optimizer $env:TAG" --notes "$notes" --generate-notes
